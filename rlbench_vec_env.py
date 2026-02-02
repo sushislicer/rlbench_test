@@ -298,17 +298,57 @@ def main():
     parser.add_argument("--num_envs", type=int, default=2)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--task", type=str, default="OpenDrawer")
-    args = parser.parse_args()
+    parser.add_argument("--robot_setup", type=str, default="panda")
+    parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256])
+    parser.add_argument("--arm_mode", type=str, default="planning")
+    # Ignore other args to prevent errors if user adds them back
+    args, _ = parser.parse_known_args()
     
-    env = RLBenchVectorEnv(args.num_envs, args.task)
+    print(f"Initializing {args.num_envs} environments for task {args.task}...")
+    
     try:
-        env.reset()
-        for _ in range(args.steps):
+        env = RLBenchVectorEnv(
+            num_envs=args.num_envs, 
+            task_name=args.task,
+            image_size=tuple(args.image_size),
+            robot_setup=args.robot_setup,
+            arm_mode=args.arm_mode
+        )
+
+        print("Resetting...")
+        t0 = time.time()
+        obs = env.reset()
+        t_reset = time.time() - t0
+        print(f"Reset done in {t_reset:.2f}s")
+
+        print(f"Running {args.steps} steps...")
+        
+        total_time = 0.0
+        for s in range(args.steps):
             actions = np.zeros((args.num_envs, 8), dtype=np.float32)
             actions[:, 7] = 1.0 # Open gripper
+            
+            t_start = time.time()
             env.step(actions)
+            t_step = time.time() - t_start
+            total_time += t_step
+            
+            if s % 10 == 0:
+                print(f"Step {s}/{args.steps}: {t_step:.4f}s")
+
+        print(f"Total time: {total_time:.2f}s")
+
+    except Exception:
+        import traceback
+        print("\n" + "="*60)
+        print("ERROR IN MAIN PROCESS")
+        print("="*60)
+        traceback.print_exc()
+        print("="*60 + "\n")
+        raise
     finally:
-        env.close()
+        if 'env' in locals():
+            env.close()
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
