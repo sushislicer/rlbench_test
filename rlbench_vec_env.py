@@ -6,6 +6,7 @@ Optimized RLBench Vectorized Environment for Multi-GPU Headless Training
 from __future__ import annotations
 
 import os
+import sys
 import time
 import argparse
 import multiprocessing as mp
@@ -15,6 +16,8 @@ import numpy as np
 import cv2
 import subprocess
 import random
+import atexit
+import traceback
 
 # =============================================================================
 # Utils
@@ -70,7 +73,7 @@ def _start_xvfb(display_str: str, max_tries: int = 20):
         # Wait for it to start
         start_time = time.time()
         ok = False
-        while time.time() - start_time < 5.0: # Wait up to 5s
+        while time.time() - start_time < 10.0: # Wait up to 10s
             if p.poll() is not None:
                 # Crashed
                 err = p.stderr.read().decode("utf-8", errors="ignore") if p.stderr else "unknown"
@@ -99,10 +102,11 @@ def _start_xvfb(display_str: str, max_tries: int = 20):
 
 def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict):
     xvfb_proc = None
+    env = None
     try:
         # 1. Setup Display
-        # Stagger start to reduce system load spikes
-        time.sleep(random.uniform(0.1, 2.0))
+        # Stagger start to reduce system load spikes (32 workers total)
+        time.sleep(random.uniform(0.5, 5.0))
         
         local_rank = _get_local_rank()
         # Unique display base: 20000 + local_rank*1000 + worker_rank*10
@@ -117,6 +121,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         os.makedirs(home_dir, exist_ok=True)
         os.environ["HOME"] = home_dir
 
+        print(f"[Worker {rank}] Starting Xvfb on {display}...", flush=True)
+
         # 2. Import RLBench (must be after DISPLAY set)
         from rlbench.environment import Environment
         from rlbench.action_modes.action_mode import MoveArmThenGripper
@@ -129,6 +135,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         img_size = env_config["image_size"]
         obs_config = ObservationConfig()
         obs_config.set_all(False)
+        # 开启需要的相机
         obs_config.front_camera = CameraConfig(rgb=True, image_size=img_size)
         obs_config.wrist_camera = CameraConfig(rgb=True, image_size=img_size)
         obs_config.gripper_pose = True
@@ -148,6 +155,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             headless=True,
             robot_setup=env_config["robot_setup"]
         )
+        print(f"[Worker {rank}] Launching RLBench...", flush=True)
         env.launch()
         
         task_class = name_to_task_class(env_config["task_name"])
@@ -163,6 +171,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             arrays[name] = full_arr[rank]
 
         # 5. Loop
+        print(f"[Worker {rank}] Ready.", flush=True)
         pipe.send("ready")
         
         done_flag = False
@@ -191,11 +200,18 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             elif cmd == "close":
                 break
                 
-    except Exception as e:
-        pipe.send(("error", str(e)))
+    except Exception:
+        # Print traceback immediately to stderr so it's captured in logs
+        sys.stderr.write(f"\n[Worker {rank}] CRASHED:\n")
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        try:
+            pipe.send(("error", traceback.format_exc()))
+        except:
+            pass
     finally:
         try:
-            env.shutdown()
+            if env: env.shutdown()
         except:
             pass
         if xvfb_proc:
@@ -233,6 +249,9 @@ class RLBenchVectorEnv:
         self.procs = []
         self.pipes = []
         
+        # Register cleanup
+        atexit.register(self.close)
+        
         # Create Shared Memory
         for name, (shape, dtype) in self.shm_specs.items():
             size = int(np.prod(shape)) * np.dtype(dtype).itemsize
@@ -250,7 +269,7 @@ class RLBenchVectorEnv:
             "arm_mode": arm_mode
         }
         
-        print(f"Starting {num_envs} workers...")
+        print(f"Starting {num_envs} workers...", flush=True)
         for i in range(num_envs):
             parent, child = ctx.Pipe()
             p = ctx.Process(target=_worker_entry, args=(i, child, self.shm_info, env_config))
@@ -262,36 +281,55 @@ class RLBenchVectorEnv:
         for i, pipe in enumerate(self.pipes):
             msg = pipe.recv()
             if msg != "ready":
+                if isinstance(msg, tuple) and msg[0] == "error":
+                    raise RuntimeError(f"Worker {i} failed:\n{msg[1]}")
                 raise RuntimeError(f"Worker {i} failed: {msg}")
-        print("All workers ready.")
+        print("All workers ready.", flush=True)
 
     def reset(self):
         for pipe in self.pipes:
             pipe.send(("reset", None))
         for pipe in self.pipes:
-            pipe.recv()
+            self._recv_ack(pipe)
         return self._get_obs()
 
     def step(self, actions):
         for i, pipe in enumerate(self.pipes):
             pipe.send(("step", actions[i]))
         for pipe in self.pipes:
-            pipe.recv()
+            self._recv_ack(pipe)
         return self._get_obs(), self.arrays["reward"].copy(), self.arrays["done"].copy()
+
+    def _recv_ack(self, pipe):
+        msg = pipe.recv()
+        if msg != "done":
+            if isinstance(msg, tuple) and msg[0] == "error":
+                raise RuntimeError(f"Worker error:\n{msg[1]}")
+            raise RuntimeError(f"Unexpected worker msg: {msg}")
 
     def _get_obs(self):
         return {k: self.arrays[k].copy() for k in ["front_rgb", "wrist_rgb", "gripper_pose", "gripper_open"]}
 
     def close(self):
+        # Unregister to avoid double call
+        atexit.unregister(self.close)
+        
+        print("[RLBenchVecEnv] Closing...", flush=True)
         for pipe in self.pipes:
             try: pipe.send(("close", None))
             except: pass
+        for pipe in self.pipes:
+            try: pipe.close()
+            except: pass
+            
         for p in self.procs:
             p.join(timeout=5)
             if p.is_alive(): p.terminate()
+            
         for shm in self.shm_objs:
             try: shm.close(); shm.unlink()
             except: pass
+        print("[RLBenchVecEnv] Closed.", flush=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -304,7 +342,7 @@ def main():
     # Ignore other args to prevent errors if user adds them back
     args, _ = parser.parse_known_args()
     
-    print(f"Initializing {args.num_envs} environments for task {args.task}...")
+    print(f"Initializing {args.num_envs} environments for task {args.task}...", flush=True)
     
     try:
         env = RLBenchVectorEnv(
@@ -315,13 +353,13 @@ def main():
             arm_mode=args.arm_mode
         )
 
-        print("Resetting...")
+        print("Resetting...", flush=True)
         t0 = time.time()
         obs = env.reset()
         t_reset = time.time() - t0
-        print(f"Reset done in {t_reset:.2f}s")
+        print(f"Reset done in {t_reset:.2f}s", flush=True)
 
-        print(f"Running {args.steps} steps...")
+        print(f"Running {args.steps} steps...", flush=True)
         
         total_time = 0.0
         for s in range(args.steps):
@@ -334,17 +372,17 @@ def main():
             total_time += t_step
             
             if s % 10 == 0:
-                print(f"Step {s}/{args.steps}: {t_step:.4f}s")
+                print(f"Step {s}/{args.steps}: {t_step:.4f}s", flush=True)
 
-        print(f"Total time: {total_time:.2f}s")
+        print(f"Total time: {total_time:.2f}s", flush=True)
 
     except Exception:
-        import traceback
-        print("\n" + "="*60)
-        print("ERROR IN MAIN PROCESS")
-        print("="*60)
-        traceback.print_exc()
-        print("="*60 + "\n")
+        print("\n" + "="*60, file=sys.stderr)
+        print("ERROR IN MAIN PROCESS", file=sys.stderr)
+        print("="*60, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("="*60 + "\n", file=sys.stderr)
+        sys.stderr.flush()
         raise
     finally:
         if 'env' in locals():
