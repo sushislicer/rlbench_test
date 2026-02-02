@@ -130,6 +130,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
+        from rlbench.backend.exceptions import InvalidActionError
 
         def _camel_to_snake(name):
             import re
@@ -199,11 +200,15 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                     arrays["done"][0] = True
                     arrays["reward"][0] = 0.0
                 else:
-                    obs, reward, term = task_env.step(data)
-                    _write_obs(arrays, obs)
-                    arrays["reward"][0] = reward
-                    arrays["done"][0] = term
-                    done_flag = bool(term)
+                    try:
+                        obs, reward, term = task_env.step(data)
+                        _write_obs(arrays, obs)
+                        arrays["reward"][0] = reward
+                        arrays["done"][0] = term
+                        done_flag = bool(term)
+                    except InvalidActionError:
+                        arrays["reward"][0] = 0.0
+                        arrays["done"][0] = False
                 pipe.send("done")
             
             elif cmd == "step_chunk":
@@ -222,14 +227,19 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 last_reward = 0.0
                 
                 for j in range(len(actions)):
-                    obs, reward, term = task_env.step(actions[j])
-                    last_reward = float(reward)
-                    reward_sum += float(reward)
-                    n_steps += 1
-                    _write_obs(arrays, obs)
-                    if bool(term):
-                        done_flag = True
-                        break
+                    try:
+                        obs, reward, term = task_env.step(actions[j])
+                        last_reward = float(reward)
+                        reward_sum += float(reward)
+                        n_steps += 1
+                        _write_obs(arrays, obs)
+                        if bool(term):
+                            done_flag = True
+                            break
+                    except InvalidActionError:
+                        last_reward = 0.0
+                        n_steps += 1
+                        pass
                 
                 arrays["reward_sum"][0] = float(reward_sum)
                 arrays["n_steps"][0] = int(n_steps)
