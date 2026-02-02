@@ -164,7 +164,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         env.launch()
         
         task_name = env_config["task_name"]
-        # Try to convert CamelCase to snake_case if needed
         if not task_name.islower():
             task_name = _camel_to_snake(task_name)
             
@@ -206,6 +205,37 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                     arrays["done"][0] = term
                     done_flag = bool(term)
                 pipe.send("done")
+            
+            elif cmd == "step_chunk":
+                # data is actions (K, 8)
+                if done_flag:
+                    arrays["reward_sum"][0] = 0.0
+                    arrays["n_steps"][0] = 0
+                    arrays["reward"][0] = 0.0
+                    arrays["done"][0] = True
+                    pipe.send("done")
+                    continue
+                
+                actions = data
+                reward_sum = 0.0
+                n_steps = 0
+                last_reward = 0.0
+                
+                for j in range(len(actions)):
+                    obs, reward, term = task_env.step(actions[j])
+                    last_reward = float(reward)
+                    reward_sum += float(reward)
+                    n_steps += 1
+                    _write_obs(arrays, obs)
+                    if bool(term):
+                        done_flag = True
+                        break
+                
+                arrays["reward_sum"][0] = float(reward_sum)
+                arrays["n_steps"][0] = int(n_steps)
+                arrays["reward"][0] = float(last_reward)
+                arrays["done"][0] = bool(done_flag)
+                pipe.send("done")
                 
             elif cmd == "close":
                 break
@@ -221,7 +251,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             sys.stderr.write(
                 "\n[Worker Hint] 'Handle ... does not exist' usually means the RLBench scene failed to load.\n"
                 "Possible causes:\n"
-                "1. COPPELIASIM_ROOT points to an incompatible version.\n"
+                "1. COPPELIASIM_ROOT points to an incompatible version (Must be 4.1.0).\n"
                 "2. Multiple CoppeliaSim instances are conflicting on the ZMQ Remote API port (default 23000).\n"
                 "   Solution: Disable the 'ZMQ remote API' add-on in CoppeliaSim's installation folder (addOns.txt or remove the lua file).\n"
                 "3. Headless rendering (Xvfb) failed to initialize OpenGL properly.\n"
@@ -263,6 +293,8 @@ class RLBenchVectorEnv:
             "gripper_pose": ((num_envs, 7), np.float32),
             "gripper_open": ((num_envs, 1), np.float32),
             "reward":       ((num_envs, 1), np.float32),
+            "reward_sum":   ((num_envs, 1), np.float32),
+            "n_steps":      ((num_envs, 1), np.int32),
             "done":         ((num_envs, 1), np.bool_),
         }
         
@@ -323,6 +355,13 @@ class RLBenchVectorEnv:
             self._recv_ack(pipe)
         return self._get_obs(), self.arrays["reward"].copy(), self.arrays["done"].copy()
 
+    def step_chunk(self, actions_chunk):
+        for i, pipe in enumerate(self.pipes):
+            pipe.send(("step_chunk", actions_chunk[i]))
+        for pipe in self.pipes:
+            self._recv_ack(pipe)
+        return self._get_obs(), self.arrays["reward_sum"].copy(), self.arrays["done"].copy(), self.arrays["n_steps"].copy()
+
     def _recv_ack(self, pipe):
         msg = pipe.recv()
         if msg != "done":
@@ -354,6 +393,17 @@ class RLBenchVectorEnv:
             except: pass
         print("[RLBenchVecEnv] Closed.", flush=True)
 
+def _build_action_from_obs(obs_dict, idx, rng, pos_noise_std=0.01, gripper_close_prob=0.05):
+    gp = obs_dict["gripper_pose"][idx] # (7,)
+    pos = gp[:3]
+    quat = gp[3:7]
+    
+    pos_noisy = pos + rng.normal(loc=0.0, scale=pos_noise_std, size=(3,)).astype(np.float32)
+    
+    gripper = 0.0 if rng.random() < gripper_close_prob else 1.0
+    
+    return np.concatenate([pos_noisy, quat, [gripper]]).astype(np.float32)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_envs", type=int, default=2)
@@ -362,6 +412,7 @@ def main():
     parser.add_argument("--robot_setup", type=str, default="panda")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256])
     parser.add_argument("--arm_mode", type=str, default="planning")
+    parser.add_argument("--action_chunk", type=int, default=1)
     # Ignore other args to prevent errors if user adds them back
     args, _ = parser.parse_known_args()
     
@@ -383,20 +434,46 @@ def main():
         t_reset = time.time() - t0
         print(f"Reset done in {t_reset:.2f}s", flush=True)
 
-        print(f"Running {args.steps} steps...", flush=True)
+        print(f"Running {args.steps} steps (chunk={args.action_chunk})...", flush=True)
         
+        rng = np.random.default_rng(seed=0)
         total_time = 0.0
-        for s in range(args.steps):
-            actions = np.zeros((args.num_envs, 8), dtype=np.float32)
-            actions[:, 7] = 1.0 # Open gripper
+        s = 0
+        
+        while s < args.steps:
+            k = min(args.action_chunk, args.steps - s)
             
-            t_start = time.time()
-            env.step(actions)
-            t_step = time.time() - t_start
-            total_time += t_step
-            
+            if k == 1:
+                actions = np.zeros((args.num_envs, 8), dtype=np.float32)
+                for i in range(args.num_envs):
+                    actions[i] = _build_action_from_obs(obs, i, rng)
+                
+                t_start = time.time()
+                obs, reward, done = env.step(actions)
+                t_step = time.time() - t_start
+                total_time += t_step
+            else:
+                actions_chunk = np.zeros((args.num_envs, k, 8), dtype=np.float32)
+                for i in range(args.num_envs):
+                    gp = obs["gripper_pose"][i]
+                    pos = gp[:3]
+                    quat = gp[3:7]
+                    
+                    pos_seq = pos + rng.normal(0, 0.01, size=(k, 3)).astype(np.float32)
+                    quat_seq = np.tile(quat, (k, 1))
+                    grip_seq = (rng.random(size=(k, 1)) >= 0.05).astype(np.float32)
+                    
+                    actions_chunk[i] = np.concatenate([pos_seq, quat_seq, grip_seq], axis=1)
+
+                t_start = time.time()
+                obs, reward, done, n_steps = env.step_chunk(actions_chunk)
+                t_step = time.time() - t_start
+                total_time += t_step
+
             if s % 10 == 0:
                 print(f"Step {s}/{args.steps}: {t_step:.4f}s", flush=True)
+            
+            s += k
 
         print(f"Total time: {total_time:.2f}s", flush=True)
 
