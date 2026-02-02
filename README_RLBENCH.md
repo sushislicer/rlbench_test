@@ -95,7 +95,8 @@ sudo apt-get install -y \
 
 ```bash
 sudo apt-get update
-xargs -a apt-packages.txt sudo apt-get install -y
+# NOTE: avoid `xargs -a` because some images have an `xargs` that doesn't support it.
+sudo apt-get install -y $(grep -vE '^\s*($|#)' apt-packages.txt)
 ```
 
 ### 2. 安装 CoppeliaSim
@@ -209,6 +210,14 @@ echo -e 'Section "ServerFlags"\n\tOption "MaxClients" "2048"\nEndSection\n' | su
 sudo apt-get update
 sudo apt-get install -y nvidia-xconfig
 ```
+
+如果出现 `E: Unable to locate package nvidia-xconfig`：
+
+* 常见原因是容器/镜像的 apt 源不完整，或 GPU 驱动工具被放在宿主机而不是容器内。
+* 你可以在远端机器上用 `apt-cache search nvidia-xconfig` / `which nvidia-xconfig` 确认它来自哪个包。
+* 如果确实无法安装：
+  - 在宿主机侧完成 `Xorg`/`nvidia-xconfig` 的配置，再把容器挂到同一个显示/驱动栈；或
+  - 直接走本仓库的 Xvfb 路径（见 “Torchrun 运行”里的方案 B）。
 
 （在容器里可能没有 `sudo`，可直接用 `apt-get`；另外你可能需要具备足够权限/挂载 `/etc` 才能写入 X 配置。）
 

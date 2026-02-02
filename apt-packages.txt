@@ -1,9 +1,13 @@
 # System packages commonly needed for RLBench + CoppeliaSim on Ubuntu.
 #
 # This is NOT a pip requirements file.
-# Install with apt, e.g.:
+# Install with apt.
+#
+# NOTE: Some environments ship a minimal `xargs` that doesn't support `-a`.
+# Use this portable form instead:
+#
 #   sudo apt-get update
-#   xargs -a apt-packages.txt sudo apt-get install -y
+#   sudo apt-get install -y $(grep -vE '^\s*($|#)' apt-packages.txt)
 
 # basics
 git
@@ -38,5 +42,10 @@ libxkbcommon-x11-0
 ffmpeg
 
 # optional: required only if following RLBench upstream GPU headless X setup
-nvidia-xconfig
-
+#
+# NOTE:
+# - On some minimal/container images `apt` cannot find this package (missing repos),
+#   or GPU driver tooling is expected to live on the host.
+# - If unavailable, either configure X on the host, or use the Xvfb-based path.
+#
+# nvidia-xconfig
