@@ -28,6 +28,14 @@ This repository provides an optimized, vectorized environment wrapper for RLBenc
     
     Ensure `COPPELIASIM_ROOT` environment variable is set to your CoppeliaSim 4.1.0 installation directory.
 
+3.  **Reinstall PyRep & RLBench**:
+    If you changed your CoppeliaSim version (e.g. downgraded from 4.10 to 4.1), you **MUST** reinstall PyRep so it links against the correct library.
+    
+    ```bash
+    chmod +x reinstall_rlbench.sh
+    ./reinstall_rlbench.sh
+    ```
+
 ## Usage with Torchrun
 
 To run the vectorized environment across multiple GPUs (e.g., 4 GPUs), use `torchrun`.
