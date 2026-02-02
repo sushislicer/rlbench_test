@@ -442,8 +442,8 @@ class RLBenchVectorEnv:
         self.pipes = []
 
         try:
+            # 2. Allocate shared memory blocks
             for name, (shape, dtype) in self.shm_specs.items():
-                # 计算字节大小
                 size = int(np.prod(shape)) * np.dtype(dtype).itemsize
                 shm = shared_memory.SharedMemory(create=True, size=size)
                 self.shm_objs.append(shm)
@@ -453,38 +453,32 @@ class RLBenchVectorEnv:
                     "shape": shape,
                     "dtype": np.dtype(dtype).str,
                 }
-
-                # 创建主进程视图
                 self.arrays[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
 
-        # 2. 启动 Workers
-        # ---------------------------------------------------------------------
+            # 3. Start workers
             self.ctx = mp.get_context("spawn")
-        
-        env_config = {
-            "task_name": task_name,
-            "image_size": image_size,
-            "robot_setup": robot_setup,
-            "record_video": record_video,
-            "output_dir": output_dir,
-            "fps": float(fps),
-            "arm_mode": str(arm_mode),
-            "headless": True,
-        }
+
+            env_config = {
+                "task_name": task_name,
+                "image_size": image_size,
+                "robot_setup": robot_setup,
+                "record_video": record_video,
+                "output_dir": output_dir,
+                "fps": float(fps),
+                "arm_mode": str(arm_mode),
+                "headless": True,
+            }
 
             print(f"[RLBenchVecEnv] Starting {num_envs} workers...")
             for i in range(num_envs):
                 parent_conn, child_conn = self.ctx.Pipe()
-                p = self.ctx.Process(
-                    target=_worker_entry,
-                    args=(i, child_conn, self.shm_info, env_config)
-                )
+                p = self.ctx.Process(target=_worker_entry, args=(i, child_conn, self.shm_info, env_config))
                 p.start()
                 self.procs.append(p)
                 self.pipes.append(parent_conn)
-                child_conn.close() # Close child handle in parent
+                child_conn.close()  # Close child handle in parent
 
-            # 等待所有 Worker Ready
+            # Wait for all workers ready
             for i, pipe in enumerate(self.pipes):
                 try:
                     msg = pipe.recv()
@@ -501,7 +495,7 @@ class RLBenchVectorEnv:
             print(f"[RLBenchVecEnv] All {num_envs} workers ready.")
 
         except Exception:
-            # Ensure we don't leak shared memory when a worker fails to start.
+            # Ensure we don't leak resources when a worker fails to start.
             try:
                 self.close()
             except Exception:
