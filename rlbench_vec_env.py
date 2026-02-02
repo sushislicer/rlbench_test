@@ -89,29 +89,6 @@ def _start_xvfb(display_str: str, max_tries: int = 64):
         except Exception:
             pass
 
-
-def _maybe_isolate_coppeliasim_home(*, local_env_rank: int) -> None:
-    """Optionally isolate CoppeliaSim's per-user config directory.
-
-    CoppeliaSim writes state under ~/.CoppeliaSim. When launching many instances
-    concurrently (torchrun ranks * env workers), sharing the same HOME can
-    increase the chance of crashes/corruption.
-
-    If RLBENCH_ISOLATE_HOME=1, set HOME to a per-worker path under
-    /tmp/rlbench_home/<rank>/<env>.
-    """
-
-    if str(os.environ.get("RLBENCH_ISOLATE_HOME", "0")).strip() != "1":
-        return
-    base = str(os.environ.get("RLBENCH_HOME_BASE", "/tmp/rlbench_home")).strip()
-    gr = _get_global_rank()
-    p = os.path.join(base, f"rank{int(gr)}", f"env{int(local_env_rank)}")
-    try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
-        return
-    os.environ["HOME"] = p
-
     try:
         start_disp = int(str(display_str).lstrip(":"))
     except Exception as e:
@@ -167,6 +144,29 @@ def _maybe_isolate_coppeliasim_home(*, local_env_rank: int) -> None:
             pass
 
     raise RuntimeError(last_err if last_err is not None else f"Xvfb failed: no available DISPLAY starting at {display_str}")
+
+
+def _maybe_isolate_coppeliasim_home(*, local_env_rank: int) -> None:
+    """Optionally isolate CoppeliaSim's per-user config directory.
+
+    CoppeliaSim writes state under ~/.CoppeliaSim. When launching many instances
+    concurrently (torchrun ranks * env workers), sharing the same HOME can
+    increase the chance of crashes/corruption.
+
+    If RLBENCH_ISOLATE_HOME=1, set HOME to a per-worker path under
+    /tmp/rlbench_home/<rank>/<env>.
+    """
+
+    if str(os.environ.get("RLBENCH_ISOLATE_HOME", "0")).strip() != "1":
+        return
+    base = str(os.environ.get("RLBENCH_HOME_BASE", "/tmp/rlbench_home")).strip()
+    gr = _get_global_rank()
+    p = os.path.join(base, f"rank{int(gr)}", f"env{int(local_env_rank)}")
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        return
+    os.environ["HOME"] = p
 
 # =============================================================================
 # Worker Function
