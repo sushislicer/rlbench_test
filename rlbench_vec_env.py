@@ -204,9 +204,22 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         # Print traceback immediately to stderr so it's captured in logs
         sys.stderr.write(f"\n[Worker {rank}] CRASHED:\n")
         traceback.print_exc(file=sys.stderr)
+        
+        # Add hints for common errors
+        err_msg = traceback.format_exc()
+        if "Handle" in err_msg and "does not exist" in err_msg:
+            sys.stderr.write(
+                "\n[Worker Hint] 'Handle ... does not exist' usually means the RLBench scene failed to load.\n"
+                "Possible causes:\n"
+                "1. COPPELIASIM_ROOT points to an incompatible version.\n"
+                "2. Multiple CoppeliaSim instances are conflicting on the ZMQ Remote API port (default 23000).\n"
+                "   Solution: Disable the 'ZMQ remote API' add-on in CoppeliaSim's installation folder (addOns.txt or remove the lua file).\n"
+                "3. Headless rendering (Xvfb) failed to initialize OpenGL properly.\n"
+            )
+        
         sys.stderr.flush()
         try:
-            pipe.send(("error", traceback.format_exc()))
+            pipe.send(("error", err_msg))
         except:
             pass
     finally:
@@ -342,6 +355,7 @@ def main():
     # Ignore other args to prevent errors if user adds them back
     args, _ = parser.parse_known_args()
     
+    print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task}...", flush=True)
     
     try:

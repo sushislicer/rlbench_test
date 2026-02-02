@@ -17,7 +17,16 @@ This repository provides an optimized, vectorized environment wrapper for RLBenc
     ```
 
 2.  **CoppeliaSim**:
-    Ensure `COPPELIASIM_ROOT` environment variable is set to your CoppeliaSim installation directory.
+    **CRITICAL**: You MUST use **CoppeliaSim V4.1.0**. Newer versions (like 4.10.0) are NOT compatible with RLBench/PyRep and will cause "Handle ... does not exist" errors.
+    
+    Use the provided script to install the correct version:
+    ```bash
+    chmod +x install_coppeliasim.sh
+    ./install_coppeliasim.sh
+    source ~/.bashrc  # Or manually export the variables printed by the script
+    ```
+    
+    Ensure `COPPELIASIM_ROOT` environment variable is set to your CoppeliaSim 4.1.0 installation directory.
 
 ## Usage with Torchrun
 
