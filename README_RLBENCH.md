@@ -261,6 +261,22 @@ sudo apt-get install -y nvidia-xconfig
 
 > 另外，本仓库在 [`RLBenchVectorEnv.__init__()`](rlbench_vec_env.py:399) 中增加了 worker 启动失败时的资源清理，避免出现你日志里那种 `leaked shared_memory objects`。
 
+4) `RuntimeError: Handle Panda does not exist.`（或类似的 `Handle <X> does not exist`）
+
+这通常表示：**CoppeliaSim 当前加载的 scene 里没有 RLBench 期望的机器人对象**。
+
+常见原因：
+
+* CoppeliaSim 启动早期崩溃或 scene 加载失败（经常与上面的 `buffer overflow` / add-ons 崩溃一起出现）。
+* CoppeliaSim 版本与 RLBench/PyRep 不兼容（RLBench 上游明确围绕 CoppeliaSim v4.1.0 构建）。
+* RLBench/PyRep 安装来源混杂（例如 RLBench from git，但 PyRep 是不同版本的 wheel）。
+
+建议排查：
+
+* 先禁用 CoppeliaSim 的网络 add-ons（`ZMQ/WebSocket remote API server`），确保单实例稳定启动。
+* 确保 RLBench + PyRep 都用同一来源安装（推荐使用 [`requirements-rlbench.txt`](requirements-rlbench.txt:1)）。
+* 确认你的 `robot_setup`（本仓库默认 `panda`，可用 [`--robot_setup`](rlbench_vec_env.py:630) 显式指定）。
+
 
 > 如果你的 GPU 本身就是 headless（没有 display outputs），上游说明可去掉 `--use-display-device=None`。
 

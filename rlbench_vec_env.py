@@ -76,9 +76,10 @@ def _start_xvfb(display_str: str, max_tries: int = 64):
     if display_str is None or str(display_str).strip() == "":
         raise ValueError("display_str must be non-empty")
 
-    # Qt may need XDG_RUNTIME_DIR on headless servers
+    # Qt may need XDG_RUNTIME_DIR on headless servers.
+    # Use a per-process directory to reduce cross-process interference.
     if "XDG_RUNTIME_DIR" not in os.environ or str(os.environ["XDG_RUNTIME_DIR"]).strip() == "":
-        os.environ["XDG_RUNTIME_DIR"] = "/tmp/runtime-root"
+        os.environ["XDG_RUNTIME_DIR"] = f"/tmp/runtime-root-{int(os.getpid())}"
         try:
             os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
             try:
@@ -87,6 +88,29 @@ def _start_xvfb(display_str: str, max_tries: int = 64):
                 pass
         except Exception:
             pass
+
+
+def _maybe_isolate_coppeliasim_home(*, local_env_rank: int) -> None:
+    """Optionally isolate CoppeliaSim's per-user config directory.
+
+    CoppeliaSim writes state under ~/.CoppeliaSim. When launching many instances
+    concurrently (torchrun ranks * env workers), sharing the same HOME can
+    increase the chance of crashes/corruption.
+
+    If RLBENCH_ISOLATE_HOME=1, set HOME to a per-worker path under
+    /tmp/rlbench_home/<rank>/<env>.
+    """
+
+    if str(os.environ.get("RLBENCH_ISOLATE_HOME", "0")).strip() != "1":
+        return
+    base = str(os.environ.get("RLBENCH_HOME_BASE", "/tmp/rlbench_home")).strip()
+    gr = _get_global_rank()
+    p = os.path.join(base, f"rank{int(gr)}", f"env{int(local_env_rank)}")
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        return
+    os.environ["HOME"] = p
 
     try:
         start_disp = int(str(display_str).lstrip(":"))
@@ -172,6 +196,9 @@ def _worker_entry(
         # allow selecting a GPU-specific DISPLAY like ":99.<LOCAL_RANK>".
         _maybe_set_display_from_base()
 
+        # Optional: isolate ~/.CoppeliaSim per env worker to reduce multi-instance crashes.
+        _maybe_isolate_coppeliasim_home(local_env_rank=int(rank))
+
         if env_config.get("headless", True) and per_process_xvfb:
             # Make DISPLAY allocation stable across torchrun ranks to reduce collisions.
             # Each torchrun rank gets its own window of display numbers.
@@ -183,7 +210,10 @@ def _worker_entry(
             os.environ["DISPLAY"] = str(actual_display)
 
     except Exception as e:
-        pipe.send(("error", f"Xvfb setup failed: {e}"))
+        try:
+            pipe.send(("error", f"Xvfb setup failed: {e}"))
+        except Exception:
+            pass
         return
 
     # 2. 初始化 RLBench 环境
@@ -237,7 +267,21 @@ def _worker_entry(
         task_env = env.get_task(task_class)
 
     except Exception as e:
-        pipe.send(("error", f"RLBench init failed: {e}"))
+        err_msg = f"RLBench init failed: {e}"
+        # Common failure: CoppeliaSim launched but the expected RLBench robot is missing
+        # from the currently loaded scene.
+        if "Handle" in str(e) and "does not exist" in str(e):
+            err_msg += (
+                "\n\nHints:" 
+                "\n- This usually means the RLBench scene did not load correctly, or CoppeliaSim crashed early."
+                "\n- Verify you are using the RLBench-recommended CoppeliaSim version and that RLBench/PyRep are installed from matching sources."
+                "\n- If you see WebSocket/ZMQ remote API add-ons starting in CoppeliaSim logs, try disabling those add-ons (they can crash under many concurrent instances)."
+                "\n- Also verify robot_setup is correct (default: panda)."
+            )
+        try:
+            pipe.send(("error", err_msg))
+        except Exception:
+            pass
         if xvfb_proc: xvfb_proc.kill()
         return
 
@@ -254,7 +298,10 @@ def _worker_entry(
             full_arr = np.ndarray(info["shape"], dtype=np.dtype(info["dtype"]), buffer=shm.buf)
             arrays[name] = full_arr[rank] # Slice: [rank, ...]
     except Exception as e:
-        pipe.send(("error", f"Shared memory connect failed: {e}"))
+        try:
+            pipe.send(("error", f"Shared memory connect failed: {e}"))
+        except Exception:
+            pass
         return
 
     # 视频录制相关
@@ -470,6 +517,7 @@ class RLBenchVectorEnv:
             }
 
             print(f"[RLBenchVecEnv] Starting {num_envs} workers...")
+            stagger_s = float(os.environ.get("RLBENCH_WORKER_START_STAGGER_S", "0") or 0.0)
             for i in range(num_envs):
                 parent_conn, child_conn = self.ctx.Pipe()
                 p = self.ctx.Process(target=_worker_entry, args=(i, child_conn, self.shm_info, env_config))
@@ -477,6 +525,8 @@ class RLBenchVectorEnv:
                 self.procs.append(p)
                 self.pipes.append(parent_conn)
                 child_conn.close()  # Close child handle in parent
+                if stagger_s > 0:
+                    time.sleep(stagger_s)
 
             # Wait for all workers ready
             for i, pipe in enumerate(self.pipes):
