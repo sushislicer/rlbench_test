@@ -9,11 +9,14 @@ Optimized RLBench Vectorized Environment with Shared Memory
 3. 视频录制优化：可选开启，避免 I/O 阻塞。
 """
 
+from __future__ import annotations
+
 import os
 import time
 import argparse
 import multiprocessing as mp
 from multiprocessing import shared_memory
+from multiprocessing.connection import Connection
 import numpy as np
 import cv2
 
@@ -147,7 +150,7 @@ def _start_xvfb(display_str: str, max_tries: int = 64):
 
 def _worker_entry(
     rank: int,
-    pipe: mp.connection.Connection,
+    pipe: Connection,
     shm_info: dict,
     env_config: dict
 ):

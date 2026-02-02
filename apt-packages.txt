@@ -1,0 +1,42 @@
+# System packages commonly needed for RLBench + CoppeliaSim on Ubuntu.
+#
+# This is NOT a pip requirements file.
+# Install with apt, e.g.:
+#   sudo apt-get update
+#   xargs -a apt-packages.txt sudo apt-get install -y
+
+# basics
+git
+wget
+unzip
+
+# X / headless utilities
+xvfb
+x11-xserver-utils
+xserver-xorg
+mesa-utils
+
+# OpenGL / GLX / OSMesa
+libgl1-mesa-dev
+libgl1-mesa-glx
+libglew-dev
+libosmesa6-dev
+
+# Qt "xcb" platform plugin runtime deps (fixes: "Could not load the Qt platform plugin xcb")
+libx11-xcb1
+libxcb-icccm4
+libxcb-image0
+libxcb-keysyms1
+libxcb-randr0
+libxcb-render-util0
+libxcb-shape0
+libxcb-xfixes0
+libxcb-xinerama0
+libxkbcommon-x11-0
+
+# optional: video tooling (often helpful if mp4 writing fails)
+ffmpeg
+
+# optional: required only if following RLBench upstream GPU headless X setup
+nvidia-xconfig
+

@@ -1,0 +1,11 @@
+# Convenience meta-requirements file.
+#
+# Installs:
+#  - Python deps for the scripts in this repo
+#  - RLBench stack (PyRep + RLBench) from GitHub
+#
+# Note: You STILL need system packages (see apt-packages.txt) and CoppeliaSim.
+
+-r requirements.txt
+-r requirements-rlbench.txt
+

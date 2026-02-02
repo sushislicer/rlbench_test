@@ -1,0 +1,11 @@
+# RLBench stack (Python-level) dependencies.
+#
+# IMPORTANT:
+# - PyRep builds native extensions and requires CoppeliaSim installed +
+#   COPPELIASIM_ROOT/LD_LIBRARY_PATH/QT_QPA_PLATFORM_PLUGIN_PATH set before install.
+# - These are NOT sufficient alone; you still need the system deps in
+#   apt-packages.txt and the CoppeliaSim install.
+
+git+https://github.com/stepjam/PyRep.git
+git+https://github.com/stepjam/RLBench.git
+

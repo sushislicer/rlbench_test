@@ -9,3 +9,11 @@ dependencies = [
   "gymnasium>=0.29.0",
   "opencv-python-headless>=4.8.0,<4.12",
 ]
+
+[project.optional-dependencies]
+# Installs RLBench + PyRep directly from GitHub.
+# Still requires you to install CoppeliaSim + set env vars first.
+rlbench = [
+  "pyrep @ git+https://github.com/stepjam/PyRep.git",
+  "rlbench @ git+https://github.com/stepjam/RLBench.git",
+]

@@ -43,6 +43,29 @@ python3 -m pip install -r requirements.txt
 uv pip install -r requirements.txt
 ```
 
+如果你希望“一次性装齐 Python 侧依赖”（本仓库脚本 + PyRep + RLBench）：
+
+```bash
+python3 -m pip install -r requirements-all.txt
+```
+
+或使用 `uv`：
+
+```bash
+uv pip install -r requirements-all.txt
+```
+
+> 注意：`requirements-all.txt` 仍不包含系统依赖与 CoppeliaSim 本体；系统依赖见 [`apt-packages.txt`](apt-packages.txt:1)。
+
+RLBench 本体（PyRep + RLBench）如果你也希望用“requirements 文件”一键装：
+
+```bash
+python3 -m pip install -r requirements-rlbench.txt
+```
+
+> 注意：这一步会触发 PyRep 的本地编译，要求你已安装好 CoppeliaSim 并配置 `COPPELIASIM_ROOT` 等环境变量。
+> 若你更倾向于按上游 README 逐步安装，请直接看下面的“安装 CoppeliaSim / PyRep / RLBench”。
+
 依赖版本说明：
 
 * `requirements.txt` 里将 `opencv-python-headless` pin 到 `<4.12`，以兼容 `numpy<2`（OpenCV 4.12+ 在 Python>=3.9 上声明需要 numpy>=2）。
@@ -66,6 +89,13 @@ sudo apt-get install -y \
     net-tools \
     xvfb \
     x11-xserver-utils
+```
+
+补充：如果你在运行 CoppeliaSim/RLBench 时遇到 Qt 报错（例如 `Could not load the Qt platform plugin "xcb" ...`），通常是 **系统缺少 Qt xcb 相关依赖库**，请额外安装（已整理在 [`apt-packages.txt`](apt-packages.txt:1)）：
+
+```bash
+sudo apt-get update
+xargs -a apt-packages.txt sudo apt-get install -y
 ```
 
 ### 2. 安装 CoppeliaSim
@@ -137,6 +167,29 @@ print("CoppeliaSim Root:", os.environ.get("COPPELIASIM_ROOT"))
 
 ---
 
+## 依赖是否“装全”的最小核对清单（远端机器）
+
+这类问题无法在本地凭空 100% 确认你们远端的真实安装状态，但可以用下面清单对照排查：
+
+1) 系统包：按 [`apt-packages.txt`](apt-packages.txt:1) 安装（尤其是 Qt xcb 相关依赖）。
+2) CoppeliaSim：已安装 v4.1.0，并设置 `COPPELIASIM_ROOT` / `LD_LIBRARY_PATH` / `QT_QPA_PLATFORM_PLUGIN_PATH`（见 [`README_RLBENCH.md`](README_RLBENCH.md:71)）。
+3) Python 包：
+   - RLBench 本体：PyRep + RLBench（见 [`requirements-rlbench.txt`](requirements-rlbench.txt:1) 或 [`README_RLBENCH.md`](README_RLBENCH.md:89) 的手动步骤）。
+   - 本仓库脚本：见 [`requirements.txt`](requirements.txt:1)。
+4) Torchrun：需要远端环境里有 PyTorch（`torchrun` 来自 `torch`），建议用你们已有的 CUDA/torch 安装方式，不建议在 requirements 里强行 pin。
+
+### 你们远端日志里两个报错的对应处理
+
+1) `qt.qpa.plugin: Could not load the Qt platform plugin "xcb" ...`
+
+这不是 Python requirements 能解决的，属于 **系统库缺失**。按 [`apt-packages.txt`](apt-packages.txt:1) 安装 Qt xcb 相关依赖（以及 OpenGL/X 相关包）。
+
+2) `AttributeError: module 'multiprocessing' has no attribute 'connection'`
+
+这说明你在远端运行的脚本版本还在用旧的类型注解写法。当前仓库已改为显式导入 [`multiprocessing.connection.Connection`](rlbench_vec_env.py:19) 并在 [`_worker_entry()`](rlbench_vec_env.py:148) 使用该类型。
+
+---
+
 ## Headless / 服务器渲染（对齐 RLBench 上游 README）
 
 如果你在 **无显示器的服务器** 上需要 **GPU headless 渲染**（例如多卡服务器、云主机），RLBench 上游 README 推荐启动一个 X server（例如 `X :99`），并用 `DISPLAY=:99.<gpu_id>` 选择 GPU。
@@ -149,6 +202,27 @@ sudo nvidia-xconfig -a --use-display-device=None --virtual=1280x1024
 # increase max clients
 echo -e 'Section "ServerFlags"\n\tOption "MaxClients" "2048"\nEndSection\n' | sudo tee /etc/X11/xorg.conf.d/99-maxclients.conf
 ```
+
+如果提示 `nvidia-xconfig: command not found`：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y nvidia-xconfig
+```
+
+（在容器里可能没有 `sudo`，可直接用 `apt-get`；另外你可能需要具备足够权限/挂载 `/etc` 才能写入 X 配置。）
+
+### 常见报错速查
+
+1) `qt.qpa.plugin: Could not load the Qt platform plugin "xcb" ...`
+
+* 典型原因：缺少 `libxcb-...` / `libxkbcommon-x11-0` 等系统库。
+* 解决：安装 [`apt-packages.txt`](apt-packages.txt:1) 里的 Qt xcb 依赖。
+
+2) `EOFError`（主进程在 `conn.recv()` 处卡住/报错）
+
+* 通常意味着 worker 进程启动早期崩溃（例如 Qt/GL 初始化失败）。先把上面的 Qt/Display/X 相关问题解决，EOFError 会随之消失。
+
 
 > 如果你的 GPU 本身就是 headless（没有 display outputs），上游说明可去掉 `--use-display-device=None`。
 
