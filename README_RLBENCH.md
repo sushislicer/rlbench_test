@@ -197,6 +197,16 @@ print("CoppeliaSim Root:", os.environ.get("COPPELIASIM_ROOT"))
 
 ### 1) 一次性配置 X config（只需做一次）
 
+先确认 GPU/驱动在远端可见（这一步 **可以** 用 `nvidia-smi`）：
+
+```bash
+nvidia-smi
+```
+
+但需要明确：`nvidia-smi` **只能检查驱动与 GPU 状态**，并不能替代 `nvidia-xconfig` 去生成/修改 Xorg 配置。
+
+如果你希望走上游推荐的 **GPU headless 渲染**（`X :99` + `DISPLAY=:99.<gpu_id>`），仍需要一套可工作的 X server / Xorg 配置。
+
 ```bash
 sudo nvidia-xconfig -a --use-display-device=None --virtual=1280x1024
 
@@ -219,6 +229,8 @@ sudo apt-get install -y nvidia-xconfig
   - 在宿主机侧完成 `Xorg`/`nvidia-xconfig` 的配置，再把容器挂到同一个显示/驱动栈；或
   - 直接走本仓库的 Xvfb 路径（见 “Torchrun 运行”里的方案 B）。
 
+> 结论：`nvidia-smi` 可用于“确认 GPU 可用”，但 **不能替代** `nvidia-xconfig`/Xorg 配置。
+
 （在容器里可能没有 `sudo`，可直接用 `apt-get`；另外你可能需要具备足够权限/挂载 `/etc` 才能写入 X 配置。）
 
 ### 常见报错速查
@@ -231,6 +243,23 @@ sudo apt-get install -y nvidia-xconfig
 2) `EOFError`（主进程在 `conn.recv()` 处卡住/报错）
 
 * 通常意味着 worker 进程启动早期崩溃（例如 Qt/GL 初始化失败）。先把上面的 Qt/Display/X 相关问题解决，EOFError 会随之消失。
+
+3) `*** buffer overflow detected ***` / `signal 11` / `The X11 connection broke`
+
+* 这通常是 **CoppeliaSim 原生库崩溃**（不是 Python 异常）。常见诱因：
+  - 同时启动大量实例时，CoppeliaSim 的某些 add-on（尤其是 WebSocket/ZMQ remote API server）并发启动导致不稳定/端口/SSL 初始化问题。
+  - X server / DISPLAY 不稳定（共享 display、X server 被杀、或 Xvfb 资源不足）。
+
+建议排查顺序：
+
+* 先用小规模跑通：单进程、`--num_envs 1`。
+* 然后逐步扩大到 2/4/8...，找到崩溃门槛。
+* 如果日志里反复出现 `ZMQ remote API server` / `WebSocket remote API server`（你贴的日志就是这种），建议在 CoppeliaSim 目录里 **禁用这些 add-ons**：
+  - 位置通常在 `${COPPELIASIM_ROOT}/addOns/` 下面。
+  - 例如把 `addOns/Connectivity` 整个目录改名为 `Connectivity.disabled`，或移走 `ZMQ remote API server.lua` / `WebSocket remote API server.lua`。
+  - RLBench/PyRep 一般不需要这些 add-ons。
+
+> 另外，本仓库在 [`RLBenchVectorEnv.__init__()`](rlbench_vec_env.py:399) 中增加了 worker 启动失败时的资源清理，避免出现你日志里那种 `leaked shared_memory objects`。
 
 
 > 如果你的 GPU 本身就是 headless（没有 display outputs），上游说明可去掉 `--use-display-device=None`。

@@ -438,26 +438,28 @@ class RLBenchVectorEnv:
         self.shm_info = {} # 传递给 Worker 的信息
         self.arrays = {}   # 主进程访问的 Numpy 视图
 
-        for name, (shape, dtype) in self.shm_specs.items():
-            # 计算字节大小
-            size = int(np.prod(shape)) * np.dtype(dtype).itemsize
-            shm = shared_memory.SharedMemory(create=True, size=size)
-            self.shm_objs.append(shm)
-            
-            self.shm_info[name] = {
-                "name": shm.name,
-                "shape": shape,
-                "dtype": np.dtype(dtype).str,
-            }
-            
-            # 创建主进程视图
-            self.arrays[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+        self.procs = []
+        self.pipes = []
+
+        try:
+            for name, (shape, dtype) in self.shm_specs.items():
+                # 计算字节大小
+                size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+                shm = shared_memory.SharedMemory(create=True, size=size)
+                self.shm_objs.append(shm)
+
+                self.shm_info[name] = {
+                    "name": shm.name,
+                    "shape": shape,
+                    "dtype": np.dtype(dtype).str,
+                }
+
+                # 创建主进程视图
+                self.arrays[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
 
         # 2. 启动 Workers
         # ---------------------------------------------------------------------
-        self.ctx = mp.get_context("spawn")
-        self.procs = []
-        self.pipes = []
+            self.ctx = mp.get_context("spawn")
         
         env_config = {
             "task_name": task_name,
@@ -470,27 +472,41 @@ class RLBenchVectorEnv:
             "headless": True,
         }
 
-        print(f"[RLBenchVecEnv] Starting {num_envs} workers...")
-        for i in range(num_envs):
-            parent_conn, child_conn = self.ctx.Pipe()
-            p = self.ctx.Process(
-                target=_worker_entry,
-                args=(i, child_conn, self.shm_info, env_config)
-            )
-            p.start()
-            self.procs.append(p)
-            self.pipes.append(parent_conn)
-            child_conn.close() # Close child handle in parent
+            print(f"[RLBenchVecEnv] Starting {num_envs} workers...")
+            for i in range(num_envs):
+                parent_conn, child_conn = self.ctx.Pipe()
+                p = self.ctx.Process(
+                    target=_worker_entry,
+                    args=(i, child_conn, self.shm_info, env_config)
+                )
+                p.start()
+                self.procs.append(p)
+                self.pipes.append(parent_conn)
+                child_conn.close() # Close child handle in parent
 
-        # 等待所有 Worker Ready
-        for i, pipe in enumerate(self.pipes):
-            msg = pipe.recv()
-            if msg != "ready":
-                if isinstance(msg, tuple) and msg[0] == "error":
-                    raise RuntimeError(f"Worker {i} failed: {msg[1]}")
-                raise RuntimeError(f"Worker {i} failed to start: {msg}")
-        
-        print(f"[RLBenchVecEnv] All {num_envs} workers ready.")
+            # 等待所有 Worker Ready
+            for i, pipe in enumerate(self.pipes):
+                try:
+                    msg = pipe.recv()
+                except EOFError as e:
+                    raise RuntimeError(
+                        "Worker crashed before sending 'ready' (EOFError). "
+                        "This usually indicates a CoppeliaSim/PyRep startup failure (Qt/X11/OpenGL/add-ons)."
+                    ) from e
+                if msg != "ready":
+                    if isinstance(msg, tuple) and msg[0] == "error":
+                        raise RuntimeError(f"Worker {i} failed: {msg[1]}")
+                    raise RuntimeError(f"Worker {i} failed to start: {msg}")
+
+            print(f"[RLBenchVecEnv] All {num_envs} workers ready.")
+
+        except Exception:
+            # Ensure we don't leak shared memory when a worker fails to start.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def reset(self):
         """
@@ -576,6 +592,11 @@ class RLBenchVectorEnv:
                 pipe.send(("close", None))
             except:
                 pass
+        for pipe in self.pipes:
+            try:
+                pipe.close()
+            except Exception:
+                pass
         
         for p in self.procs:
             p.join(timeout=5)
@@ -584,8 +605,14 @@ class RLBenchVectorEnv:
                 
         # 释放共享内存
         for shm in self.shm_objs:
-            shm.close()
-            shm.unlink()
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except Exception:
+                pass
         print("[RLBenchVecEnv] Closed.")
 
 # =============================================================================
