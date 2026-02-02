@@ -25,6 +25,28 @@
 
 本指南基于 Linux (Ubuntu 20.04/22.04) 环境。
 
+### 0. 安装本仓库脚本的 Python 依赖（推荐）
+
+本仓库的 `rlbench_vec_env.py` / `mp_rlbench_env_test.py` 额外依赖一些纯 Python 包（例如 `gymnasium`、`opencv`、`numpy`）。
+
+建议在独立虚拟环境里安装（避免与系统里已有的 numpy/scipy/matplotlib 等发生版本冲突）。
+
+使用 pip：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+如果你使用 `uv`：
+
+```bash
+uv pip install -r requirements.txt
+```
+
+依赖版本说明：
+
+* `requirements.txt` 里将 `opencv-python-headless` pin 到 `<4.12`，以兼容 `numpy<2`（OpenCV 4.12+ 在 Python>=3.9 上声明需要 numpy>=2）。
+
 ### 1. 系统依赖
 
 首先安装必要的系统库和工具，特别是 Xvfb（用于 Headless 渲染）和 OpenGL 库：
@@ -48,24 +70,21 @@ sudo apt-get install -y \
 
 ### 2. 安装 CoppeliaSim
 
-RLBench 依赖特定版本的 CoppeliaSim (通常推荐 V4.1.0 或 V4.2.0，请参考 PyRep 官方文档确认最新兼容版本)。
+RLBench 上游 README 指明 RLBench 围绕 **CoppeliaSim v4.1.0** 与 **PyRep** 构建。建议优先按上游版本安装以避免兼容性问题。
 
 ```bash
-# 下载 CoppeliaSim Edu V4.1.0 (示例)
-wget https://www.coppeliarobotics.com/files/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+# set env variables
+export COPPELIASIM_ROOT=${HOME}/CoppeliaSim
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT
+export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT
 
-# 解压
-tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
-
-# 移动到合适的位置 (例如用户主目录)
-mv CoppeliaSim_Edu_V4_1_0_Ubuntu20_04 $HOME/CoppeliaSim
-
-# 配置环境变量 (建议写入 ~/.bashrc)
-echo 'export COPPELIASIM_ROOT=$HOME/CoppeliaSim' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT' >> ~/.bashrc
-echo 'export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT' >> ~/.bashrc
-source ~/.bashrc
+# download + extract (Ubuntu 20.04 build shown in upstream README)
+wget https://downloads.coppeliarobotics.com/V4_1_0/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+mkdir -p $COPPELIASIM_ROOT && tar -xf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz -C $COPPELIASIM_ROOT --strip-components 1
+rm -rf CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
 ```
+
+> 建议把上述 `export ...` 写入你的 `~/.bashrc` / `~/.zshrc`，并在新 shell 中 `source` 生效。
 
 ### 3. 安装 PyRep
 
@@ -76,24 +95,26 @@ git clone https://github.com/stepjam/PyRep.git
 cd PyRep
 
 # 安装 Python 依赖
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
-# 安装 PyRep
-pip install .
+# 安装 PyRep（会根据 COPPELIASIM_ROOT 构建）
+python3 -m pip install .
 ```
 
 ### 4. 安装 RLBench
 
+上游 README 推荐直接用 pip 从 GitHub 安装：
+
 ```bash
-cd ..
+python3 -m pip install git+https://github.com/stepjam/RLBench.git
+```
+
+如果你需要修改 RLBench 源码进行开发，可以改为 clone + editable：
+
+```bash
 git clone https://github.com/stepjam/RLBench.git
 cd RLBench
-
-# 安装 Python 依赖
-pip install -r requirements.txt
-
-# 安装 RLBench
-pip install .
+python3 -m pip install -e .
 ```
 
 ### 5. 验证安装
@@ -112,6 +133,42 @@ from rlbench.tasks import ReachTarget
 
 print("CoppeliaSim Root:", os.environ.get("COPPELIASIM_ROOT"))
 # 如果没有报错，说明安装成功
+```
+
+---
+
+## Headless / 服务器渲染（对齐 RLBench 上游 README）
+
+如果你在 **无显示器的服务器** 上需要 **GPU headless 渲染**（例如多卡服务器、云主机），RLBench 上游 README 推荐启动一个 X server（例如 `X :99`），并用 `DISPLAY=:99.<gpu_id>` 选择 GPU。
+
+### 1) 一次性配置 X config（只需做一次）
+
+```bash
+sudo nvidia-xconfig -a --use-display-device=None --virtual=1280x1024
+
+# increase max clients
+echo -e 'Section "ServerFlags"\n\tOption "MaxClients" "2048"\nEndSection\n' | sudo tee /etc/X11/xorg.conf.d/99-maxclients.conf
+```
+
+> 如果你的 GPU 本身就是 headless（没有 display outputs），上游说明可去掉 `--use-display-device=None`。
+
+### 2) 运行时启动 X server
+
+```bash
+# nohup + disown is important for the X server to keep running in the background
+sudo nohup X :99 & disown
+```
+
+测试：
+
+```bash
+DISPLAY=:99 glxgears
+```
+
+多 GPU 选择（上游示例）：
+
+```bash
+DISPLAY=:99.<gpu_id> glxgears
 ```
 
 ---
@@ -172,14 +229,61 @@ python3 mp_rlbench_env_test.py \
 
 在分布式训练场景下，通常使用 `torchrun` 启动。虽然本脚本主要演示环境封装，但可以直接作为 Worker 脚本运行：
 
+#### (A) 4-GPU + headless（使用上游 X server 方法，推荐）
+
+1) 先按上面的“Headless / 服务器渲染”启动 `X :99`。
+
+2) 禁用每个 worker 自启 Xvfb，并让每个 `torchrun` rank 自动选择 `DISPLAY=:99.<LOCAL_RANK>`：
+
 ```bash
-# 单机单卡/多卡启动 (示例：使用 1 个节点，1 个 Master 进程)
-torchrun --nproc_per_node=1 rlbench_vec_env.py --num_envs 64
+export RLBENCH_PER_PROCESS_XVFB=0
+export RLBENCH_BASE_DISPLAY=:99
+```
+
+3) 4 GPU 并行：
+
+```bash
+# 总环境数 = nproc_per_node * num_envs
+# 例如：4 GPUs * 16 env/rank = 64 env total
+torchrun --nproc_per_node=4 rlbench_vec_env.py \
+  --num_envs 16 \
+  --steps 100 \
+  --task OpenDrawer \
+  --arm_mode ik \
+  --action_chunk 16 \
+  --copy_obs 0
+```
+
+#### (B) 4-GPU + headless（每个 worker 使用 Xvfb，偏兼容性优先）
+
+如果你不想配置上游的 `X :99`，本仓库默认会给每个 worker 启动独立 Xvfb（见 [`_worker_entry()`](rlbench_vec_env.py:129)）。
+
+```bash
+torchrun --nproc_per_node=4 rlbench_vec_env.py --num_envs 8 --steps 100 --task OpenDrawer
 ```
 
 **注意**：
 *   `rlbench_vec_env.py` 内部使用了 `multiprocessing.set_start_method("spawn")`，这是 PyTorch 分布式要求的。
 *   每个 `torchrun` 的 rank 进程会启动 `num_envs` 个子进程。如果你有 8 张卡，每张卡跑 8 个环境，则总共会有 64 个环境。请根据显存和 CPU 核心数调整 `num_envs`。
+
+关于 task 名称：
+
+* [`rlbench_vec_env.py`](rlbench_vec_env.py:1) / [`mp_rlbench_env_test.py`](mp_rlbench_env_test.py:1) 支持传入 `OpenDrawer` 这种 RLBench 的 **Task Class 名称**。
+* 同时也支持传入 `open_drawer` / `sweep_to_dustpan` 这种 `snake_case`（脚本会自动转换成 CamelCase 再调用 RLBench 的 `name_to_task_class`）。
+
+### mp_rlbench_env_test（你给出的命令格式）
+
+```bash
+python3 mp_rlbench_env_test.py \
+  --task_class sweep_to_dustpan \
+  --num_envs 64 \
+  --max_steps 100 \
+  --action_chunk 54 \
+  --image_size 256 256 \
+  --fps 20 \
+  --output_dir /mnt/zezhong/Genie-Envisioner/RLBench_env_test/rlbench_env_test_videos \
+  --pos_noise_std 0.01
+```
 
 ## 性能优化建议
 

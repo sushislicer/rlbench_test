@@ -202,14 +202,23 @@ def _rlbench_worker(conn, worker_idx: int, cfg: dict) -> None:
             os.environ["DISPLAY"] = str(actual_display)
 
         # 延迟导入：避免在 Xvfb 前触发 Qt 初始化链
-        from rlbench import Environment  # pyright: ignore[reportMissingImports]
+        # RLBench upstream entrypoint
+        from rlbench.environment import Environment  # pyright: ignore[reportMissingImports]
         from rlbench.action_modes.action_mode import MoveArmThenGripper  # pyright: ignore[reportMissingImports]
         from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning  # pyright: ignore[reportMissingImports]
         from rlbench.action_modes.gripper_action_modes import Discrete  # pyright: ignore[reportMissingImports]
         from rlbench.observation_config import ObservationConfig, CameraConfig  # pyright: ignore[reportMissingImports]
         from rlbench.utils import name_to_task_class  # pyright: ignore[reportMissingImports]
 
-        task_class_name = str(cfg["task_class"])
+        def _normalize_task_name(name: str) -> str:
+            # Accept either CamelCase ("OpenDrawer") or snake_case ("open_drawer").
+            n = str(name).strip()
+            if "_" in n or "-" in n:
+                parts = [p for p in n.replace("-", "_").split("_") if p]
+                return "".join([p[:1].upper() + p[1:] for p in parts])
+            return n
+
+        task_class_name = _normalize_task_name(str(cfg["task_class"]))
         image_size = cfg["image_size"]
         if not (isinstance(image_size, (tuple, list)) and len(image_size) == 2):
             raise ValueError("image_size 必须是 (H, W)")
@@ -641,4 +650,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

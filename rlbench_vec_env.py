@@ -18,6 +18,49 @@ import numpy as np
 import cv2
 
 
+def _get_int_env(keys, default: int) -> int:
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        try:
+            return int(str(v).strip())
+        except Exception:
+            continue
+    return int(default)
+
+
+def _get_local_rank() -> int:
+    # torchrun sets LOCAL_RANK; SLURM uses SLURM_LOCALID.
+    return _get_int_env(["LOCAL_RANK", "SLURM_LOCALID"], 0)
+
+
+def _get_global_rank() -> int:
+    return _get_int_env(["RANK", "SLURM_PROCID"], 0)
+
+
+def _maybe_set_display_from_base() -> None:
+    """Optionally set DISPLAY for multi-GPU headless X setup.
+
+    RLBench upstream suggests starting an X server on :99 and then selecting GPU by
+    using DISPLAY=:99.<gpu_id>. For torchrun, <gpu_id> typically matches LOCAL_RANK.
+
+    Behavior:
+    - If RLBENCH_BASE_DISPLAY is set and DISPLAY is empty, set DISPLAY.
+    - Format is controlled by RLBENCH_DISPLAY_FMT (default: "{base}.{gpu}").
+      Example: base=":99", gpu=0 -> ":99.0".
+    """
+
+    if str(os.environ.get("DISPLAY", "")).strip() != "":
+        return
+    base = str(os.environ.get("RLBENCH_BASE_DISPLAY", "")).strip()
+    if base == "":
+        return
+    fmt = str(os.environ.get("RLBENCH_DISPLAY_FMT", "{base}.{gpu}")).strip()
+    lr = _get_local_rank()
+    os.environ["DISPLAY"] = fmt.format(base=base, gpu=lr, local_rank=lr, rank=_get_global_rank())
+
+
 def _require_env(var: str) -> None:
     if var not in os.environ or str(os.environ[var]).strip() == "":
         raise RuntimeError(f"Missing required environment variable: {var}")
@@ -122,9 +165,17 @@ def _worker_entry(
         if "RLBENCH_PER_PROCESS_XVFB" in os.environ:
             per_process_xvfb = str(os.environ["RLBENCH_PER_PROCESS_XVFB"]).strip() == "1"
 
+        # If the user pre-started an X server (RLBench upstream headless instructions),
+        # allow selecting a GPU-specific DISPLAY like ":99.<LOCAL_RANK>".
+        _maybe_set_display_from_base()
+
         if env_config.get("headless", True) and per_process_xvfb:
-            base = 10000 + (int(os.getpid()) % 1000) * 64
-            start_display = f":{int(base + int(rank))}"
+            # Make DISPLAY allocation stable across torchrun ranks to reduce collisions.
+            # Each torchrun rank gets its own window of display numbers.
+            local_rank = _get_local_rank()
+            xvfb_base = _get_int_env(["RLBENCH_XVFB_BASE"], 10000)
+            xvfb_stride = _get_int_env(["RLBENCH_XVFB_STRIDE"], 2000)
+            start_display = f":{int(xvfb_base + local_rank * xvfb_stride + int(rank))}"
             xvfb_proc, actual_display = _start_xvfb(start_display)
             os.environ["DISPLAY"] = str(actual_display)
 
@@ -135,13 +186,21 @@ def _worker_entry(
     # 2. 初始化 RLBench 环境
     # -------------------------------------------------------------------------
     try:
-        from rlbench import Environment
+        from rlbench.environment import Environment
         from rlbench.action_modes.action_mode import MoveArmThenGripper
         from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
         from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaIK
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
+
+        def _normalize_task_name(name: str) -> str:
+            # Accept either CamelCase ("OpenDrawer") or snake_case ("open_drawer").
+            n = str(name).strip()
+            if "_" in n or "-" in n:
+                parts = [p for p in n.replace("-", "_").split("_") if p]
+                return "".join([p[:1].upper() + p[1:] for p in parts])
+            return n
 
         # 配置 Observation
         img_size = env_config["image_size"] # (H, W)
@@ -171,7 +230,7 @@ def _worker_entry(
         )
         env.launch()
 
-        task_class = name_to_task_class(env_config["task_name"])
+        task_class = name_to_task_class(_normalize_task_name(env_config["task_name"]))
         task_env = env.get_task(task_class)
 
     except Exception as e:
@@ -355,6 +414,7 @@ class RLBenchVectorEnv:
         self.copy_obs = bool(copy_obs)
 
         _require_env("COPPELIASIM_ROOT")
+        _maybe_set_display_from_base()
         
         # 1. 定义共享内存结构
         # ---------------------------------------------------------------------
@@ -535,6 +595,9 @@ def main():
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--task", type=str, default="OpenDrawer")
     parser.add_argument("--record", action="store_true", help="Enable video recording (slows down)")
+    parser.add_argument("--output_dir", type=str, default="rlbench_optimized_videos", help="Video output dir (if --record)")
+    parser.add_argument("--fps", type=float, default=20.0, help="Video FPS (if --record)")
+    parser.add_argument("--robot_setup", type=str, default="panda", help="RLBench robot_setup (e.g., panda)")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="Camera resolution [H W]")
     parser.add_argument("--arm_mode", type=str, default="planning", choices=["planning", "ik"], help="Arm control mode")
     parser.add_argument("--action_chunk", type=int, default=1, help="If >1, run step_chunk with this K")
@@ -551,9 +614,10 @@ def main():
         task_name=args.task,
         image_size=(int(args.image_size[0]), int(args.image_size[1])),
         record_video=args.record,
-        output_dir="rlbench_optimized_videos",
-        fps=20.0,
+        output_dir=str(args.output_dir),
+        fps=float(args.fps),
         arm_mode=str(args.arm_mode),
+        robot_setup=str(args.robot_setup),
         copy_obs=bool(int(args.copy_obs)),
     )
 

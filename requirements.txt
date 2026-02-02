@@ -1,0 +1,13 @@
+# Core Python dependencies for running the benchmark scripts in this repo.
+#
+# Note:
+# - RLBench/PyRep/CoppeliaSim are not pure-Python and are typically installed
+#   separately (see README_RLBENCH.md).
+# - We use opencv-python-headless for server/headless environments.
+
+# Keep numpy <2 to avoid breaking common scientific stack dependencies.
+# NOTE: opencv-python(-headless) 4.12+ declares numpy>=2 for Python>=3.9.
+# To stay compatible with numpy<2, pin OpenCV <4.12.
+numpy>=1.23,<2.0
+gymnasium>=0.29.0
+opencv-python-headless>=4.8.0,<4.12
