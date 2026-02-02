@@ -131,6 +131,11 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
 
+        def _camel_to_snake(name):
+            import re
+            name = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+            return re.sub('([a-z0-9])([A-Z])', r'\1_\2', name).lower()
+
         # 3. Setup Environment
         img_size = env_config["image_size"]
         obs_config = ObservationConfig()
@@ -158,7 +163,12 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         print(f"[Worker {rank}] Launching RLBench...", flush=True)
         env.launch()
         
-        task_class = name_to_task_class(env_config["task_name"])
+        task_name = env_config["task_name"]
+        # Try to convert CamelCase to snake_case if needed
+        if not task_name.islower():
+            task_name = _camel_to_snake(task_name)
+            
+        task_class = name_to_task_class(task_name)
         task_env = env.get_task(task_class)
 
         # 4. Connect Shared Memory
