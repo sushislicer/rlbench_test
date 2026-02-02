@@ -16,7 +16,87 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 import numpy as np
 import cv2
-import ctypes
+
+
+def _require_env(var: str) -> None:
+    if var not in os.environ or str(os.environ[var]).strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {var}")
+
+
+def _start_xvfb(display_str: str, max_tries: int = 64):
+    """Start a dedicated Xvfb server for the worker and return (proc, actual_display)."""
+    import subprocess
+
+    if display_str is None or str(display_str).strip() == "":
+        raise ValueError("display_str must be non-empty")
+
+    # Qt may need XDG_RUNTIME_DIR on headless servers
+    if "XDG_RUNTIME_DIR" not in os.environ or str(os.environ["XDG_RUNTIME_DIR"]).strip() == "":
+        os.environ["XDG_RUNTIME_DIR"] = "/tmp/runtime-root"
+        try:
+            os.makedirs(os.environ["XDG_RUNTIME_DIR"], exist_ok=True)
+            try:
+                os.chmod(os.environ["XDG_RUNTIME_DIR"], 0o700)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    try:
+        start_disp = int(str(display_str).lstrip(":"))
+    except Exception as e:
+        raise ValueError(f"Invalid display_str: {display_str}") from e
+
+    last_err = None
+    for off in range(int(max_tries)):
+        disp = int(start_disp + off)
+        disp_str = f":{disp}"
+        sock_path = f"/tmp/.X11-unix/X{disp}"
+        if os.path.exists(sock_path):
+            continue
+
+        os.environ["DISPLAY"] = disp_str
+        p = subprocess.Popen(
+            ["Xvfb", disp_str, "-screen", "0", "1024x768x24", "-ac", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+        ok = False
+        for _ in range(50):  # ~2.5s
+            if p.poll() is not None:
+                err_txt = ""
+                try:
+                    if p.stderr is not None:
+                        err_txt = p.stderr.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    err_txt = ""
+                last_err = f"Xvfb failed: display={disp_str} exit_code={p.returncode} stderr={err_txt.strip()}"
+                break
+            if os.path.exists(sock_path):
+                ok = True
+                break
+            time.sleep(0.05)
+
+        if ok:
+            try:
+                if p.stderr is not None:
+                    p.stderr.close()
+            except Exception:
+                pass
+            return p, disp_str
+
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=1.0)
+                except Exception:
+                    p.kill()
+        except Exception:
+            pass
+
+    raise RuntimeError(last_err if last_err is not None else f"Xvfb failed: no available DISPLAY starting at {display_str}")
 
 # =============================================================================
 # Worker Function
@@ -38,23 +118,15 @@ def _worker_entry(
     # 注意：如果系统资源不足，可能需要考虑多个 Worker 共享 Display（需测试稳定性）
     xvfb_proc = None
     try:
-        if env_config.get("headless", True):
-            # 简单的 Display 分配策略：基数 + rank
-            display_id = 10000 + (os.getpid() % 10000) + rank
-            display_str = f":{display_id}"
-            os.environ["DISPLAY"] = display_str
-            
-            # 启动 Xvfb
-            # -screen 0 1024x768x24 是常见配置
-            xvfb_cmd = [
-                "Xvfb", display_str, "-screen", "0", "1024x768x24", "-ac", "-nolisten", "tcp"
-            ]
-            import subprocess
-            xvfb_proc = subprocess.Popen(
-                xvfb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            # 等待 Xvfb 启动
-            time.sleep(1.0) 
+        per_process_xvfb = True
+        if "RLBENCH_PER_PROCESS_XVFB" in os.environ:
+            per_process_xvfb = str(os.environ["RLBENCH_PER_PROCESS_XVFB"]).strip() == "1"
+
+        if env_config.get("headless", True) and per_process_xvfb:
+            base = 10000 + (int(os.getpid()) % 1000) * 64
+            start_display = f":{int(base + int(rank))}"
+            xvfb_proc, actual_display = _start_xvfb(start_display)
+            os.environ["DISPLAY"] = str(actual_display)
 
     except Exception as e:
         pipe.send(("error", f"Xvfb setup failed: {e}"))
@@ -66,6 +138,7 @@ def _worker_entry(
         from rlbench import Environment
         from rlbench.action_modes.action_mode import MoveArmThenGripper
         from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
+        from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaIK
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
@@ -80,10 +153,15 @@ def _worker_entry(
         obs_config.gripper_pose = True
         obs_config.gripper_open = True
 
-        action_mode = MoveArmThenGripper(
-            arm_action_mode=EndEffectorPoseViaPlanning(),
-            gripper_action_mode=Discrete(),
-        )
+        arm_mode = str(env_config.get("arm_mode", "planning")).lower().strip()
+        if arm_mode == "planning":
+            arm_action_mode = EndEffectorPoseViaPlanning()
+        elif arm_mode == "ik":
+            arm_action_mode = EndEffectorPoseViaIK()
+        else:
+            raise ValueError(f"Unsupported arm_mode: {arm_mode} (supported: planning, ik)")
+
+        action_mode = MoveArmThenGripper(arm_action_mode=arm_action_mode, gripper_action_mode=Discrete())
 
         env = Environment(
             action_mode=action_mode,
@@ -111,7 +189,7 @@ def _worker_entry(
             shm_objs[name] = shm
             # 创建 numpy 数组视图
             # 注意：这里创建的是整个 batch 的视图，我们需要切片出当前 rank 的部分
-            full_arr = np.ndarray(info["shape"], dtype=info["dtype"], buffer=shm.buf)
+            full_arr = np.ndarray(info["shape"], dtype=np.dtype(info["dtype"]), buffer=shm.buf)
             arrays[name] = full_arr[rank] # Slice: [rank, ...]
     except Exception as e:
         pipe.send(("error", f"Shared memory connect failed: {e}"))
@@ -131,27 +209,31 @@ def _worker_entry(
     def write_obs_to_shm(obs):
         # Front RGB
         if hasattr(obs, "front_rgb"):
-            arrays["front_rgb"][:] = obs.front_rgb
+            arrays["front_rgb"][:] = np.asarray(obs.front_rgb, dtype=np.uint8)
         # Wrist RGB
         if hasattr(obs, "wrist_rgb"):
-            arrays["wrist_rgb"][:] = obs.wrist_rgb
+            arrays["wrist_rgb"][:] = np.asarray(obs.wrist_rgb, dtype=np.uint8)
         # Gripper Pose
         if hasattr(obs, "gripper_pose"):
-            arrays["gripper_pose"][:] = obs.gripper_pose
+            arrays["gripper_pose"][:] = np.asarray(obs.gripper_pose, dtype=np.float32)
         # Gripper Open
         if hasattr(obs, "gripper_open"):
-            arrays["gripper_open"][:] = obs.gripper_open
+            # RLBench may expose scalar or 1-element array
+            go = np.asarray(obs.gripper_open, dtype=np.float32).reshape(-1)
+            arrays["gripper_open"][0] = float(go[0])
 
     # 4. 主循环
     # -------------------------------------------------------------------------
     pipe.send("ready")
 
+    done_flag = False
     try:
         while True:
             cmd, data = pipe.recv()
 
             if cmd == "reset":
                 desc, obs = task_env.reset()
+                done_flag = False
                 write_obs_to_shm(obs)
                 
                 # 重置视频录制
@@ -173,12 +255,18 @@ def _worker_entry(
                 pipe.send("done")
 
             elif cmd == "step":
+                if done_flag:
+                    arrays["reward"][0] = 0.0
+                    arrays["done"][0] = True
+                    pipe.send("done")
+                    continue
                 action = data # (8,)
                 obs, reward, terminate = task_env.step(action)
                 
                 write_obs_to_shm(obs)
                 arrays["reward"][0] = reward
                 arrays["done"][0] = terminate
+                done_flag = bool(terminate)
 
                 if recording:
                     if hasattr(obs, "front_rgb"):
@@ -186,6 +274,39 @@ def _worker_entry(
                     if hasattr(obs, "wrist_rgb"):
                         video_writer_wrist.write(cv2.cvtColor(obs.wrist_rgb, cv2.COLOR_RGB2BGR))
 
+                pipe.send("done")
+
+            elif cmd == "step_chunk":
+                # actions: (K, 8)
+                if done_flag:
+                    arrays["reward_sum"][0] = 0.0
+                    arrays["n_steps"][0] = 0
+                    arrays["reward"][0] = 0.0
+                    arrays["done"][0] = True
+                    pipe.send("done")
+                    continue
+
+                actions = np.asarray(data, dtype=np.float32)
+                if actions.ndim != 2 or actions.shape[1] != 8:
+                    raise ValueError(f"step_chunk expects actions (K, 8), got {actions.shape}")
+
+                reward_sum = 0.0
+                n_steps = 0
+                last_reward = 0.0
+                for j in range(int(actions.shape[0])):
+                    obs, reward, terminate = task_env.step(actions[j])
+                    last_reward = float(reward)
+                    reward_sum += float(reward)
+                    n_steps += 1
+                    write_obs_to_shm(obs)
+                    if bool(terminate):
+                        done_flag = True
+                        break
+
+                arrays["reward_sum"][0] = float(reward_sum)
+                arrays["n_steps"][0] = int(n_steps)
+                arrays["reward"][0] = float(last_reward)
+                arrays["done"][0] = bool(done_flag)
                 pipe.send("done")
 
             elif cmd == "close":
@@ -217,9 +338,23 @@ def _worker_entry(
 # =============================================================================
 
 class RLBenchVectorEnv:
-    def __init__(self, num_envs, task_name, image_size=(256, 256), robot_setup="panda", record_video=False, output_dir=""):
+    def __init__(
+        self,
+        num_envs,
+        task_name,
+        image_size=(256, 256),
+        robot_setup="panda",
+        record_video=False,
+        output_dir="",
+        fps=20.0,
+        arm_mode="planning",
+        copy_obs=True,
+    ):
         self.num_envs = num_envs
         self.image_size = image_size
+        self.copy_obs = bool(copy_obs)
+
+        _require_env("COPPELIASIM_ROOT")
         
         # 1. 定义共享内存结构
         # ---------------------------------------------------------------------
@@ -229,8 +364,10 @@ class RLBenchVectorEnv:
             "front_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
             "wrist_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
             "gripper_pose": ((num_envs, 7), np.float32),
-            "gripper_open": ((num_envs,), np.float32),
+            "gripper_open": ((num_envs, 1), np.float32),
             "reward":       ((num_envs, 1), np.float32),
+            "reward_sum":   ((num_envs, 1), np.float32),
+            "n_steps":      ((num_envs, 1), np.int32),
             "done":         ((num_envs, 1), np.bool_),
         }
 
@@ -247,7 +384,7 @@ class RLBenchVectorEnv:
             self.shm_info[name] = {
                 "name": shm.name,
                 "shape": shape,
-                "dtype": dtype
+                "dtype": np.dtype(dtype).str,
             }
             
             # 创建主进程视图
@@ -265,7 +402,9 @@ class RLBenchVectorEnv:
             "robot_setup": robot_setup,
             "record_video": record_video,
             "output_dir": output_dir,
-            "headless": True
+            "fps": float(fps),
+            "arm_mode": str(arm_mode),
+            "headless": True,
         }
 
         print(f"[RLBenchVecEnv] Starting {num_envs} workers...")
@@ -322,6 +461,28 @@ class RLBenchVectorEnv:
         
         return obs, reward, done
 
+    def step_chunk(self, actions_chunk):
+        """
+        Execute a chunk of K steps per env.
+
+        actions_chunk: (num_envs, K, 8) float32
+        Returns: obs, reward_sum, done, n_steps
+        """
+        actions_chunk = np.asarray(actions_chunk, dtype=np.float32)
+        if actions_chunk.ndim != 3 or actions_chunk.shape[0] != self.num_envs or actions_chunk.shape[2] != 8:
+            raise ValueError(f"actions_chunk must be (num_envs, K, 8), got {actions_chunk.shape}")
+
+        for i, pipe in enumerate(self.pipes):
+            pipe.send(("step_chunk", actions_chunk[i]))
+        for pipe in self.pipes:
+            self._recv_ack(pipe)
+
+        obs = self._get_obs_dict()
+        reward_sum = self.arrays["reward_sum"].copy()
+        done = self.arrays["done"].copy()
+        n_steps = self.arrays["n_steps"].copy()
+        return obs, reward_sum, done, n_steps
+
     def _recv_ack(self, pipe):
         msg = pipe.recv()
         if msg != "done":
@@ -330,13 +491,19 @@ class RLBenchVectorEnv:
             raise RuntimeError(f"Unexpected worker msg: {msg}")
 
     def _get_obs_dict(self):
-        # 返回当前共享内存的视图（或拷贝，如果需要防止修改）
-        # 这里返回拷贝以安全使用，如果追求极致速度可返回视图但需小心
+        if self.copy_obs:
+            return {
+                "front_rgb": self.arrays["front_rgb"].copy(),
+                "wrist_rgb": self.arrays["wrist_rgb"].copy(),
+                "gripper_pose": self.arrays["gripper_pose"].copy(),
+                "gripper_open": self.arrays["gripper_open"].copy(),
+            }
+        # zero-copy views (do not mutate)
         return {
-            "front_rgb": self.arrays["front_rgb"].copy(),
-            "wrist_rgb": self.arrays["wrist_rgb"].copy(),
-            "gripper_pose": self.arrays["gripper_pose"].copy(),
-            "gripper_open": self.arrays["gripper_open"].copy(),
+            "front_rgb": self.arrays["front_rgb"],
+            "wrist_rgb": self.arrays["wrist_rgb"],
+            "gripper_pose": self.arrays["gripper_pose"],
+            "gripper_open": self.arrays["gripper_open"],
         }
 
     def close(self):
@@ -368,6 +535,10 @@ def main():
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--task", type=str, default="OpenDrawer")
     parser.add_argument("--record", action="store_true", help="Enable video recording (slows down)")
+    parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256], help="Camera resolution [H W]")
+    parser.add_argument("--arm_mode", type=str, default="planning", choices=["planning", "ik"], help="Arm control mode")
+    parser.add_argument("--action_chunk", type=int, default=1, help="If >1, run step_chunk with this K")
+    parser.add_argument("--copy_obs", type=int, default=1, help="1: return copied obs; 0: return zero-copy views")
     args = parser.parse_args()
 
     # 模拟 Torchrun 环境（如果直接运行此脚本）
@@ -378,8 +549,12 @@ def main():
     env = RLBenchVectorEnv(
         num_envs=args.num_envs,
         task_name=args.task,
+        image_size=(int(args.image_size[0]), int(args.image_size[1])),
         record_video=args.record,
-        output_dir="rlbench_optimized_videos"
+        output_dir="rlbench_optimized_videos",
+        fps=20.0,
+        arm_mode=str(args.arm_mode),
+        copy_obs=bool(int(args.copy_obs)),
     )
 
     try:
@@ -389,30 +564,52 @@ def main():
         t_reset = time.time() - t0
         print(f"Reset done in {t_reset:.2f}s")
 
-        print(f"Running {args.steps} steps...")
+        if int(args.action_chunk) <= 0:
+            raise ValueError("--action_chunk must be >= 1")
+        print(f"Running {args.steps} steps... (action_chunk={int(args.action_chunk)})")
         
         # 构造随机 Action
         # RLBench Action: [x, y, z, qx, qy, qz, qw, gripper]
         # 这里简单使用 gripper_pose 加噪声
         
-        total_time = 0
-        for s in range(args.steps):
-            # 简单的 Mock Policy: 保持当前 Pose，加微小噪声
-            current_pose = obs["gripper_pose"] # (N, 7)
-            noise = np.random.normal(0, 0.001, size=(args.num_envs, 3))
-            
-            actions = np.zeros((args.num_envs, 8), dtype=np.float32)
-            actions[:, :3] = current_pose[:, :3] + noise
-            actions[:, 3:7] = current_pose[:, 3:7]
-            actions[:, 7] = 1.0 # Open gripper
-            
-            t_start = time.time()
-            obs, reward, done = env.step(actions)
-            t_step = time.time() - t_start
-            total_time += t_step
-            
+        total_time = 0.0
+        rng = np.random.default_rng(0)
+        s = 0
+        while s < int(args.steps):
+            k = int(min(int(args.action_chunk), int(args.steps) - s))
+            current_pose = obs["gripper_pose"]  # (N, 7)
+            # If copy_obs=0, current_pose is a view backed by shared memory; copy minimal data needed.
+            base_pose = np.asarray(current_pose, dtype=np.float32)
+
+            if k == 1:
+                noise = rng.normal(0, 0.001, size=(args.num_envs, 3)).astype(np.float32)
+                actions = np.zeros((args.num_envs, 8), dtype=np.float32)
+                actions[:, :3] = base_pose[:, :3] + noise
+                actions[:, 3:7] = base_pose[:, 3:7]
+                actions[:, 7] = 1.0
+
+                t_start = time.time()
+                obs, reward, done = env.step(actions)
+                t_step = time.time() - t_start
+                total_time += t_step
+            else:
+                # Build chunk: (N, K, 8)
+                pos_noise = rng.normal(0, 0.001, size=(args.num_envs, k, 3)).astype(np.float32)
+                actions_chunk = np.zeros((args.num_envs, k, 8), dtype=np.float32)
+                actions_chunk[:, :, :3] = base_pose[:, None, :3] + pos_noise
+                actions_chunk[:, :, 3:7] = base_pose[:, None, 3:7]
+                actions_chunk[:, :, 7] = 1.0
+
+                t_start = time.time()
+                obs, reward_sum, done, n_steps = env.step_chunk(actions_chunk)
+                t_step = time.time() - t_start
+                total_time += t_step
+
             if s % 10 == 0:
-                print(f"Step {s}/{args.steps}: {t_step:.4f}s (FPS: {args.num_envs/t_step:.1f})")
+                fps = (args.num_envs * k) / max(t_step, 1e-9)
+                print(f"Step {s}/{args.steps}: {t_step:.4f}s (ChunkFPS: {fps:.1f})")
+
+            s += k
 
         print(f"Total time for {args.steps} steps: {total_time:.2f}s")
         print(f"Average FPS: {(args.num_envs * args.steps) / total_time:.2f}")

@@ -2,6 +2,18 @@
 
 此项目提供了一个基于 Shared Memory 和 Multiprocessing 的高性能 RLBench 并行环境封装，专为 `torchrun` 分布式训练和 Headless 服务器环境设计。
 
+本仓库目前包含两种并行交互/基准测试方式：
+
+1) [`mp_rlbench_env_test.py`](mp_rlbench_env_test.py):
+   - 主进程 <-> N 个 worker 进程，每个 worker 维护 1 个 RLBench `TaskEnvironment`。
+   - 通过 `step_chunk` 一次发送 K 个动作，worker 内部顺序执行并写视频（默认每 env 两路视频：front+wrist）。
+   - 适合做“端到端跑通 + 诊断瓶颈”（把视频/渲染/规划都包含进去）。
+
+2) [`rlbench_vec_env.py`](rlbench_vec_env.py):
+   - 共享内存（SharedMemory）承载图像与低维状态，主进程 zero-copy 读取（可选返回拷贝）。
+   - 新增 `step_chunk` 以减少 IPC 往返开销，更接近你想要的「vectorized env」吞吐测试。
+   - 适合用于训练侧（例如重建 reward/视频编码器 reward）的大规模采样。
+
 ## 核心特性
 
 *   **高性能**：使用 Shared Memory (共享内存) 传输图像和状态，避免了 Python Pickling 的巨大开销。
@@ -115,10 +127,45 @@ print("CoppeliaSim Root:", os.environ.get("COPPELIASIM_ROOT"))
 python rlbench_vec_env.py --num_envs 64 --steps 100 --task OpenDrawer
 ```
 
+建议在 headless SSH 上显式使用 `python3`：
+
+```bash
+python3 rlbench_vec_env.py --num_envs 64 --steps 100 --task OpenDrawer
+```
+
+为了提升吞吐，推荐：
+
+```bash
+# 1) 使用 IK（通常比 planning 快很多）
+# 2) 使用 step_chunk 降低 IPC 往返（例如每次 K=16 步）
+# 3) 返回 zero-copy 共享内存视图（copy_obs=0），训练侧自行小心不要原地修改
+python3 rlbench_vec_env.py \
+  --num_envs 64 --steps 100 --task OpenDrawer \
+  --arm_mode ik --action_chunk 16 --copy_obs 0
+```
+
+如果你外部已经使用了 `xvfb-run` 或者你希望由外部统一管理 DISPLAY，可禁用每 worker 的 Xvfb：
+
+```bash
+export RLBENCH_PER_PROCESS_XVFB=0
+xvfb-run -a python3 rlbench_vec_env.py --num_envs 16 --steps 100 --task OpenDrawer
+```
+
 如果需要录制视频（会显著降低速度，仅用于调试）：
 
 ```bash
 python rlbench_vec_env.py --num_envs 4 --steps 50 --record
+```
+
+也可以使用 `mp_rlbench_env_test.py` 跑端到端（含双路视频写入 + chunk 执行时延统计）：
+
+```bash
+python3 mp_rlbench_env_test.py \
+  --task_class OpenDrawer \
+  --num_envs 8 \
+  --max_steps 100 \
+  --action_chunk 16 \
+  --image_size 256 256
 ```
 
 ### 2. 使用 Torchrun 运行
@@ -140,9 +187,25 @@ torchrun --nproc_per_node=1 rlbench_vec_env.py --num_envs 64
 2.  **CPU 核心绑定**：CoppeliaSim 非常消耗 CPU。确保机器有足够的物理核心。64 个环境建议至少有 64-128 个逻辑核心。
 3.  **渲染频率**：RLBench 默认每步都渲染。如果不需要每步都获取图像，可以修改代码降低渲染频率。
 
+额外建议（在大规模并行时常见提速手段）：
+
+4. **避免 planning**：默认 arm 控制使用 planning（慢）。优先尝试 `--arm_mode ik`（见 [`EndEffectorPoseViaIK`](rlbench_vec_env.py:142) 的选择逻辑）。
+5. **降低 IPC 往返**：使用 `--action_chunk K` 让每次通信执行 K 步（见 [`RLBenchVectorEnv.step_chunk()`](rlbench_vec_env.py:374)）。
+6. **限制线程数避免 oversubscription**（尤其 32/64 env）：
+
+```bash
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+```
+
 ## 代码结构
 
 *   `rlbench_vec_env.py`: 核心实现文件。
     *   `_worker_entry`: 子进程工作函数，负责运行 RLBench 和 Xvfb。
     *   `RLBenchVectorEnv`: 主进程接口类，管理共享内存和子进程。
     *   `main`: 测试入口。
+
+*   `mp_rlbench_env_test.py`: 多进程端到端交互测试脚本。
+    *   适合验证 headless + 多进程稳定性，并拆分 `exec_s`/`ipc_s` 时延。
