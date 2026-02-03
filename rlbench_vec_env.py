@@ -374,9 +374,11 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             xvfb_proc.terminate()
 
 def _write_obs(arrays, obs):
-    if hasattr(obs, "front_rgb"):
+    # RLBench may return RGB images as None when the corresponding camera is disabled.
+    # Guard against assigning None into numpy arrays.
+    if hasattr(obs, "front_rgb") and (obs.front_rgb is not None):
         arrays["front_rgb"][:] = obs.front_rgb
-    if hasattr(obs, "wrist_rgb"):
+    if hasattr(obs, "wrist_rgb") and (obs.wrist_rgb is not None):
         arrays["wrist_rgb"][:] = obs.wrist_rgb
     if hasattr(obs, "gripper_pose"):
         arrays["gripper_pose"][:] = obs.gripper_pose
