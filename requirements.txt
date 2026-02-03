@@ -2,7 +2,7 @@
 #
 # Note:
 # - RLBench/PyRep/CoppeliaSim are not pure-Python and are typically installed
-#   separately (see README_RLBENCH.md).
+#   separately (see README.md).
 # - We use opencv-python-headless for server/headless environments.
 
 # Keep numpy <2 to avoid breaking common scientific stack dependencies.

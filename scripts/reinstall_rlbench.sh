@@ -3,6 +3,9 @@ set -e
 
 echo "Reinstalling PyRep and RLBench..."
 
+# Run this from the repository root:
+#   bash scripts/reinstall_rlbench.sh
+
 # Check if COPPELIASIM_ROOT is set
 if [ -z "$COPPELIASIM_ROOT" ]; then
     echo "Error: COPPELIASIM_ROOT is not set."

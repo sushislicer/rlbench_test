@@ -3,6 +3,9 @@ set -e
 
 echo "Installing CoppeliaSim Edu V4.1.0 (Required for RLBench)..."
 
+# Run this from the repository root:
+#   bash scripts/install_coppeliasim.sh
+
 # Define installation path
 INSTALL_DIR="$HOME/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04"
 TAR_FILE="CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz"

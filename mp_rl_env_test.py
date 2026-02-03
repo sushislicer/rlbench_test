@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-多进程 RLBench 环境交互测试（主进程 <-> N 个环境子进程）
+多进程 RLBench 环境交互测试（主进程 <-> N 个环境子进程），偏调试/验证用途
 
 目标：
 - 启动 N 个子进程，每个子进程维护 1 个 RLBench TaskEnvironment（CoppeliaSim 限制：不能共享 env）

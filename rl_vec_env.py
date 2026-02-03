@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Optimized RLBench Vectorized Environment for Multi-GPU Headless Training
+RLBench Vectorized Environment for Headless Multi-Process / Torchrun
 """
 
 from __future__ import annotations
@@ -111,16 +111,74 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
     vw_front = None
     vw_wrist = None
     try:
-        # 1. Setup Display
-        # Stagger start to reduce system load spikes (32 workers total)
-        time.sleep(random.uniform(0.5, 5.0))
-        
+        # 1. Setup Display / Rendering backend
+        # Stagger start to reduce system load spikes
+        time.sleep(random.uniform(0.2, 2.0))
+
+        render_backend = str(env_config.get("render_backend", "xvfb")).lower().strip()
+        if render_backend not in {"xvfb", "egl", "external"}:
+            render_backend = "xvfb"
+
+        # Allow using external GPU-backed rendering by disabling per-process Xvfb.
+        # Convention compatible with mp_rlbench_env_test.py: RLBENCH_PER_PROCESS_XVFB=0 disables Xvfb.
+        per_process_xvfb = True
+        if "RLBENCH_PER_PROCESS_XVFB" in os.environ:
+            per_process_xvfb = str(os.environ["RLBENCH_PER_PROCESS_XVFB"]).strip() == "1"
+        per_process_xvfb = bool(env_config.get("per_process_xvfb", per_process_xvfb))
+
+        # EGL mode: attempt GPU-backed headless rendering (no X server).
+        # This only works if your container/host has NVIDIA drivers + EGL/GLVND correctly installed.
+        if render_backend == "egl":
+            per_process_xvfb = False
+            # Qt offscreen + EGL hints (best-effort)
+            os.environ.setdefault("QT_QPA_PLATFORM", str(env_config.get("qt_qpa_platform", "offscreen")))
+            os.environ.setdefault("QT_OPENGL", str(env_config.get("qt_opengl", "egl")))
+            # Avoid XCB integration when running without X
+            os.environ.setdefault("QT_XCB_GL_INTEGRATION", str(env_config.get("qt_xcb_gl_integration", "none")))
+            # Some OpenGL stacks respect this for EGL selection
+            os.environ.setdefault("PYOPENGL_PLATFORM", str(env_config.get("pyopengl_platform", "egl")))
+            # Ensure we don't accidentally bind to an X display
+            os.environ.pop("DISPLAY", None)
+
         local_rank = _get_local_rank()
-        # Unique display base: 20000 + local_rank*1000 + worker_rank*10
-        # This gives plenty of space between workers
-        base_disp = 20000 + (local_rank * 1000) + (rank * 10)
-        xvfb_proc, display = _start_xvfb(f":{base_disp}")
-        os.environ["DISPLAY"] = display
+
+        # Optional GL/Qt hints (best-effort; actual GPU-backed rendering depends on system setup)
+        qt_qpa = env_config.get("qt_qpa_platform")
+        if qt_qpa:
+            os.environ.setdefault("QT_QPA_PLATFORM", str(qt_qpa))
+        glx_vendor = env_config.get("glx_vendor")
+        if glx_vendor:
+            os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", str(glx_vendor))
+        if "libgl_always_software" in env_config:
+            os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", str(int(env_config.get("libgl_always_software") or 0)))
+
+        if per_process_xvfb and render_backend == "xvfb":
+            # Unique display base: 20000 + local_rank*1000 + worker_rank*10
+            # Plenty of space between workers to avoid socket collisions.
+            base_disp = 20000 + (local_rank * 1000) + (rank * 10)
+            xvfb_proc, display = _start_xvfb(f":{base_disp}")
+            os.environ["DISPLAY"] = display
+        else:
+            # External DISPLAY assignment. This does NOT start X.
+            # Expected usage:
+            # - render_backend=external: user starts GPU-backed Xorg servers (e.g. :0..:3) and we route workers.
+            # - render_backend=egl: DISPLAY is typically unset; we keep this block for compatibility.
+            display = None
+            displays = env_config.get("displays")
+            if isinstance(displays, (list, tuple)) and len(displays) > 0:
+                display = str(displays[rank % len(displays)])
+            else:
+                display_base = int(env_config.get("display_base", 0))
+                display_per_rank = bool(env_config.get("display_per_rank", True))
+                display_per_worker = bool(env_config.get("display_per_worker", False))
+                disp_idx = display_base
+                if display_per_rank:
+                    disp_idx += int(local_rank)
+                if display_per_worker:
+                    disp_idx += int(rank)
+                display = f":{disp_idx}"
+            if display and render_backend != "egl":
+                os.environ.setdefault("DISPLAY", str(display))
         
         # Isolate CoppeliaSim home to avoid config corruption
         # /tmp/coppelia_home/rank_X/env_Y
@@ -129,7 +187,10 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         os.environ["HOME"] = home_dir
 
         if env_config.get("worker_log", False):
-            print(f"[Worker {rank}] Starting Xvfb on {display}...", flush=True)
+            if per_process_xvfb:
+                print(f"[Worker {rank}] Starting Xvfb on {os.environ.get('DISPLAY')}...", flush=True)
+            else:
+                print(f"[Worker {rank}] render_backend={render_backend} DISPLAY={os.environ.get('DISPLAY', '')}", flush=True)
 
         # 2. Import RLBench (must be after DISPLAY set)
         from rlbench.environment import Environment
@@ -410,6 +471,18 @@ class RLBenchVectorEnv:
         idle_fps=0,
         verbose=True,
         worker_log=False,
+        render_backend="xvfb",
+        per_process_xvfb=True,
+        displays=None,
+        display_base=0,
+        display_per_rank=True,
+        display_per_worker=False,
+        qt_qpa_platform=None,
+        qt_opengl=None,
+        qt_xcb_gl_integration=None,
+        pyopengl_platform=None,
+        glx_vendor=None,
+        libgl_always_software=None,
     ):
         self.num_envs = num_envs
         self.verbose = bool(verbose)
@@ -457,6 +530,18 @@ class RLBenchVectorEnv:
             "realtime": realtime,
             "idle_fps": idle_fps,
             "worker_log": bool(worker_log),
+            "render_backend": str(render_backend),
+            "per_process_xvfb": bool(per_process_xvfb),
+            "displays": displays,
+            "display_base": int(display_base),
+            "display_per_rank": bool(display_per_rank),
+            "display_per_worker": bool(display_per_worker),
+            "qt_qpa_platform": qt_qpa_platform,
+            "qt_opengl": qt_opengl,
+            "qt_xcb_gl_integration": qt_xcb_gl_integration,
+            "pyopengl_platform": pyopengl_platform,
+            "glx_vendor": glx_vendor,
+            "libgl_always_software": libgl_always_software,
         }
         
         if self.verbose:
@@ -591,6 +676,41 @@ def main():
         help="If launched with torchrun, set CUDA_VISIBLE_DEVICES=LOCAL_RANK for each rank (helps GPU isolation)",
     )
     parser.add_argument(
+        "--render_backend",
+        type=str,
+        default="xvfb",
+        choices=["xvfb", "egl", "external"],
+        help="Rendering backend: xvfb (default), egl (no X), external (use existing DISPLAY)",
+    )
+    parser.add_argument(
+        "--per_process_xvfb",
+        type=int,
+        default=1,
+        help="1=spawn per-worker Xvfb (default). 0=do not spawn Xvfb (use EGL or external DISPLAY)",
+    )
+    parser.add_argument(
+        "--display_base",
+        type=int,
+        default=0,
+        help="When --render_backend external: base DISPLAY index (e.g. 0 -> :0)",
+    )
+    parser.add_argument(
+        "--display_per_rank",
+        type=int,
+        default=1,
+        help="When --render_backend external: add LOCAL_RANK to DISPLAY index (default 1)",
+    )
+    parser.add_argument(
+        "--display_per_worker",
+        type=int,
+        default=0,
+        help="When --render_backend external: also add worker id to DISPLAY index (default 0)",
+    )
+    parser.add_argument("--qt_qpa_platform", type=str, default=None, help="Set QT_QPA_PLATFORM in workers")
+    parser.add_argument("--qt_opengl", type=str, default=None, help="Set QT_OPENGL in workers (e.g. egl)")
+    parser.add_argument("--qt_xcb_gl_integration", type=str, default=None, help="Set QT_XCB_GL_INTEGRATION in workers")
+    parser.add_argument("--pyopengl_platform", type=str, default=None, help="Set PYOPENGL_PLATFORM in workers (e.g. egl)")
+    parser.add_argument(
         "--log_all_ranks",
         action="store_true",
         help="Print benchmark logs from all torchrun ranks (default: only rank 0)",
@@ -688,6 +808,15 @@ def main():
             idle_fps=args.idle_fps,
             verbose=verbose,
             worker_log=bool(getattr(args, "worker_log", False)),
+            render_backend=str(getattr(args, "render_backend", "xvfb")),
+            per_process_xvfb=bool(int(getattr(args, "per_process_xvfb", 1))),
+            display_base=int(getattr(args, "display_base", 0)),
+            display_per_rank=bool(int(getattr(args, "display_per_rank", 1))),
+            display_per_worker=bool(int(getattr(args, "display_per_worker", 0))),
+            qt_qpa_platform=getattr(args, "qt_qpa_platform", None),
+            qt_opengl=getattr(args, "qt_opengl", None),
+            qt_xcb_gl_integration=getattr(args, "qt_xcb_gl_integration", None),
+            pyopengl_platform=getattr(args, "pyopengl_platform", None),
         )
 
         if verbose:
