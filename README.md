@@ -56,6 +56,71 @@ torchrun --nproc_per_node=4 rl_vec_env.py \
     --ddp_bind_gpu
 ```
 
+When `--num_envs_total` is set, [`rl_vec_env.py`](rl_vec_env.py:1) prints an explicit distribution like:
+- `envs_per_rank=[16, 16, 16, 16]`
+
+If you do **not** use `--num_envs_total`, then `--num_envs` is **per rank** (so total envs = `--num_envs * WORLD_SIZE`).
+
+### Modes
+[`rl_vec_env.py`](rl_vec_env.py:1) supports three modes:
+
+- `--mode bench` (default): throughput benchmark loop.
+- `--mode debug`: enables a video-friendly configuration (defaults `--output_dir` and increases `--video_stride` to reduce encode load).
+- `--mode train`: minimal end-to-end loop that runs env interaction + a small PyTorch model forward/backward (for pipeline debugging, not a full RL algorithm).
+
+Example (debug w/ videos, still trying to keep runtime reasonable):
+
+```bash
+torchrun --nproc_per_node=4 rl_vec_env.py \
+  --mode debug \
+  --num_envs_total 64 \
+  --max_steps 100 \
+  --task_class OpenDrawer \
+  --action_chunk 54 \
+  --arm_mode ik \
+  --fps 20 \
+  --output_dir rlbench_vec_env_videos \
+  --video_stride 4 \
+  --ddp_bind_gpu
+```
+
+Notes:
+- By default, only env0 per rank records video; add `--video_all` to record all envs (much slower).
+- `--fps` controls the encoded video FPS (default: 20).
+- `--video_stride N` writes every N-th frame (reduces encode overhead). If you keep `--fps 20` with `--video_stride N`, the resulting video plays ~N× faster (time-lapse).
+
+### Video recording
+The `--fast` preset disables rendering (`--no_rgb`) and video recording (`--no_video`) on purpose.
+
+To save videos in [`rl_vec_env.py`](rl_vec_env.py:1):
+- pass `--output_dir <DIR>`
+- do **not** pass `--no_video`
+- do **not** pass `--no_rgb`
+
+By default, videos are recorded only for env 0; use `--video_all` to record all envs.
+
+### Success rate
+[`rl_vec_env.py`](rl_vec_env.py:1) prints a simple proxy metric at the end:
+`Success rate (done==True)` (fraction of envs that terminated early). In RLBench this typically corresponds to task success.
+
+[`mp_rlbench_env_test.py`](mp_rlbench_env_test.py:1) prints per-chunk progress (`done=...`) and average return, and always writes videos for all envs.
+
+### End-to-end training loop (pipeline debug)
+If you want a minimal end-to-end loop (env + torch forward/backward) to validate distributed launch and throughput:
+
+```bash
+torchrun --nproc_per_node=4 rl_vec_env.py \
+  --mode train \
+  --num_envs_total 64 \
+  --task_class OpenDrawer \
+  --train_updates 20 \
+  --train_lr 3e-4 \
+  --train_hidden 256 \
+  --ddp_bind_gpu
+```
+
+`--mode train` disables RGB/video by default for speed.
+
 ### Single-process (one Python process, N env worker processes)
 
 ```bash

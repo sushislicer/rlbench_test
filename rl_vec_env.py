@@ -251,9 +251,20 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         video_all = env_config.get("video_all", False)
         no_video = env_config.get("no_video", False)
         enable_rgb = bool(env_config.get("enable_rgb", True))
+        video_stride = max(1, int(env_config.get("video_stride", 1)))
+
+        # Torchrun ranks (for controlling which process writes videos)
+        global_rank = int(env_config.get("global_rank", 0))
+        video_rank0_only = bool(env_config.get("video_rank0_only", False))
         
         # Video recording requires RGB observations.
-        if output_dir and not no_video and enable_rgb and (rank == 0 or video_all):
+        if (
+            output_dir
+            and (not no_video)
+            and enable_rgb
+            and ((not video_rank0_only) or (global_rank == 0))
+            and (rank == 0 or video_all)
+        ):
             os.makedirs(output_dir, exist_ok=True)
             f_front = os.path.join(output_dir, f"env{rank}_front.mp4")
             f_wrist = os.path.join(output_dir, f"env{rank}_wrist.mp4")
@@ -334,6 +345,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         pipe.send("ready")
         
         done_flag = False
+        # Used for video frame decimation (write every N env-steps)
+        step_idx = 0
         
         while True:
             cmd, data = pipe.recv()
@@ -341,6 +354,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             if cmd == "reset":
                 _, obs = task_env.reset()
                 done_flag = False
+                step_idx = 0
                 _write_obs(arrays, obs)
                 if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
                 if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
@@ -353,7 +367,16 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                     arrays["reward"][0] = 0.0
                 else:
                     try:
+                        if enable_rgb and (vw_front is not None or vw_wrist is not None):
+                            want_frame = (step_idx % video_stride) == 0
+                            try:
+                                obs_config.front_camera.rgb = want_frame
+                                obs_config.wrist_camera.rgb = want_frame
+                            except Exception:
+                                pass
+
                         obs, reward, term = task_env.step(data)
+                        step_idx += 1
                         _write_obs(arrays, obs)
                         if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
                         if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
@@ -385,18 +408,18 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 obs = None
                 for j in range(len(actions)):
                     try:
-                        # Optional optimization: if RGB is disabled, avoid toggling per-step.
+                        # Optional optimization: if RGB is enabled, render only when we need a frame.
                         # Note: dynamic toggling is version-dependent; keep it best-effort.
-                        if enable_rgb:
-                            # Disable rendering for intermediate steps if not recording video.
-                            should_render = (vw_front is not None) or (j == len(actions) - 1)
+                        if enable_rgb and (vw_front is not None or vw_wrist is not None):
+                            want_frame = (step_idx % video_stride) == 0
                             try:
-                                obs_config.front_camera.rgb = should_render
-                                obs_config.wrist_camera.rgb = should_render
+                                obs_config.front_camera.rgb = want_frame
+                                obs_config.wrist_camera.rgb = want_frame
                             except Exception:
                                 pass
 
                         obs, reward, term = task_env.step(actions[j])
+                        step_idx += 1
                         last_reward = float(reward)
                         reward_sum += float(reward)
                         n_steps += 1
@@ -502,6 +525,9 @@ class RLBenchVectorEnv:
         pyopengl_platform=None,
         glx_vendor=None,
         libgl_always_software=None,
+        video_stride=1,
+        global_rank=0,
+        video_rank0_only=False,
     ):
         self.num_envs = num_envs
         self.verbose = bool(verbose)
@@ -561,6 +587,9 @@ class RLBenchVectorEnv:
             "pyopengl_platform": pyopengl_platform,
             "glx_vendor": glx_vendor,
             "libgl_always_software": libgl_always_software,
+            "video_stride": int(video_stride),
+            "global_rank": int(global_rank),
+            "video_rank0_only": bool(video_rank0_only),
         }
         
         if self.verbose:
@@ -659,6 +688,13 @@ def main():
     # Support both old and new args
     parser.add_argument("--num_envs", type=int, default=2)
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="bench",
+        choices=["bench", "debug", "train"],
+        help="bench: throughput benchmark; debug: save videos; train: minimal end-to-end torch training loop",
+    )
+    parser.add_argument(
         "--num_envs_total",
         type=int,
         default=None,
@@ -680,6 +716,17 @@ def main():
     parser.add_argument("--gripper_close_prob", type=float, default=0.05)
     parser.add_argument("--video_all", action="store_true", help="Record video for all environments (default: only env 0)")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording completely")
+    parser.add_argument(
+        "--video_rank0_only",
+        action="store_true",
+        help="When using torchrun, record videos only on global rank 0 (reduces overhead)",
+    )
+    parser.add_argument(
+        "--video_stride",
+        type=int,
+        default=1,
+        help="Write every Nth frame to the video (reduces encode load). Only applies when video is enabled.",
+    )
     parser.add_argument("--no_rgb", action="store_true", help="Disable RGB observations (major speedup)")
     parser.add_argument("--collision_checking", action="store_true", help="Enable collision checking in action mode (slower)")
     parser.add_argument("--realtime", action="store_true", help="Run CoppeliaSim in real-time (slower). Default: as-fast-as-possible")
@@ -739,8 +786,48 @@ def main():
         action="store_true",
         help="Print per-worker startup logs (very noisy for many envs)",
     )
+
+    # Minimal training loop settings (mode=train)
+    parser.add_argument("--train_updates", type=int, default=10, help="Number of optimizer updates")
+    parser.add_argument("--train_lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--train_hidden", type=int, default=256, help="MLP hidden size")
+    parser.add_argument("--train_log_every", type=int, default=1, help="Log every N updates")
+    parser.add_argument("--train_ckpt", type=str, default=None, help="Optional checkpoint path (rank0 only)")
     
     args, _ = parser.parse_known_args()
+
+    # Torchrun / DDP info (used for multi-GPU launches).
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = _get_local_rank()
+
+    # Mode presets (applied before --fast so they can take precedence).
+    if args.mode == "debug":
+        # Debug mode is intended for visual inspection; default to saving videos.
+        if args.output_dir is None:
+            args.output_dir = "rlbench_vec_env_videos"
+        # Keep encoding load reasonable by default.
+        if int(args.video_stride) == 1:
+            args.video_stride = 4
+        # In multi-rank runs, write videos only from global rank 0 by default.
+        if world_size > 1 and (not bool(getattr(args, "video_rank0_only", False))):
+            args.video_rank0_only = True
+        # If someone accidentally passes --fast with debug, keep visuals.
+        args.fast = False
+
+    elif args.mode == "train":
+        # Training mode is intended to be end-to-end (env + torch forward/backward), not visuals.
+        args.output_dir = None
+        args.no_video = True
+        args.no_rgb = True
+        args.video_all = False
+        # Prefer throughput settings.
+        args.arm_mode = "ik"
+        args.collision_checking = False
+        args.realtime = False
+        args.idle_fps = 0
+        # If someone passes --fast with train, it's redundant.
+        args.fast = False
 
     # Throughput preset (aimed at fast rollouts, not visuals).
     if getattr(args, "fast", False):
@@ -750,11 +837,6 @@ def main():
         args.collision_checking = False
         args.realtime = False
         args.idle_fps = 0
-
-    # Torchrun / DDP info (used for multi-GPU launches).
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = _get_local_rank()
     verbose = (world_size == 1) or bool(getattr(args, "log_all_ranks", False)) or (rank == 0)
     if world_size > 1 and verbose:
         print(f"[DDP] world_size={world_size} rank={rank} local_rank={local_rank}", flush=True)
@@ -763,7 +845,8 @@ def main():
     # CoppeliaSim rendering (OpenGL) is not always affected by CUDA_VISIBLE_DEVICES,
     # but isolating ranks is still a good practice for GPU-backed pipelines.
     if world_size > 1 and getattr(args, "ddp_bind_gpu", False):
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(local_rank))
+        # Force binding; setdefault() is too weak when the parent env already exported CUDA_VISIBLE_DEVICES.
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
     # If user specified total envs (e.g. 64) and launched with torchrun,
     # split them across ranks so total env count stays constant.
@@ -772,7 +855,14 @@ def main():
         base = total // world_size
         extra = total % world_size
         args.num_envs = base + (1 if rank < extra else 0)
-        print(f"[DDP] num_envs_total={total} -> num_envs_this_rank={args.num_envs}", flush=True)
+        if rank == 0:
+            dist = [base + (1 if r < extra else 0) for r in range(world_size)]
+            print(f"[DDP] num_envs_total={total} -> envs_per_rank={dist} (sum={sum(dist)})", flush=True)
+        if verbose:
+            print(f"[DDP] num_envs_this_rank={args.num_envs}", flush=True)
+    elif world_size > 1 and rank == 0:
+        # Common pitfall: --num_envs is PER RANK; total envs = num_envs * world_size
+        print(f"[DDP] WARNING: --num_envs is per-rank. Total envs = {int(args.num_envs) * int(world_size)}", flush=True)
     
     # Handle aliases
     if args.max_steps != 100 and args.steps == 100:
@@ -811,6 +901,18 @@ def main():
         print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
     try:
+        # Mode defaults
+        if args.mode == "debug":
+            # Debug mode is meant to save videos; if user didn't pass an output_dir,
+            # use a sensible default.
+            if args.output_dir is None:
+                args.output_dir = "rlbench_vec_env_videos"
+            # Debug mode should render unless user explicitly disabled RGB/video.
+        elif args.mode == "train":
+            # Training mode defaults to throughput unless user explicitly enables visuals.
+            # (Users can still override by passing --output_dir / removing --no_rgb etc.)
+            pass
+
         env = RLBenchVectorEnv(
             num_envs=args.num_envs, 
             task_name=args.task_class,
@@ -821,6 +923,7 @@ def main():
             output_dir=args.output_dir,
             video_all=args.video_all,
             no_video=args.no_video,
+            video_stride=int(args.video_stride),
             enable_rgb=(not args.no_rgb),
             collision_checking=args.collision_checking,
             realtime=args.realtime,
@@ -836,79 +939,225 @@ def main():
             qt_opengl=getattr(args, "qt_opengl", None),
             qt_xcb_gl_integration=getattr(args, "qt_xcb_gl_integration", None),
             pyopengl_platform=getattr(args, "pyopengl_platform", None),
+            global_rank=int(rank),
+            video_rank0_only=bool(getattr(args, "video_rank0_only", False)),
         )
 
-        if verbose:
-            print("Resetting...", flush=True)
-        t0 = time.time()
-        obs = env.reset()
-        t_reset = time.time() - t0
-        if verbose:
-            print(f"Reset done in {t_reset:.2f}s", flush=True)
+        def _run_env_loop(*, tag: str):
+            if verbose:
+                print("Resetting...", flush=True)
+            t0 = time.time()
+            obs = env.reset()
+            t_reset = time.time() - t0
+            if verbose:
+                print(f"Reset done in {t_reset:.2f}s", flush=True)
 
-        if verbose:
-            print(f"Running {args.max_steps} steps (chunk={args.action_chunk})...", flush=True)
-        
-        rng = np.random.default_rng(seed=0)
-        total_time = 0.0
-        s = 0
-        
-        chunk_latencies = []
-        chunk_exec_latencies = []
-        chunk_ipc_latencies = []
-        
-        while s < args.max_steps:
-            k = min(args.action_chunk, args.max_steps - s)
-            
-            t_start = time.time()
-            
-            if k == 1:
-                actions = np.zeros((args.num_envs, 8), dtype=np.float32)
-                for i in range(args.num_envs):
-                    actions[i] = _build_action_from_obs(obs, i, rng, args.pos_noise_std, args.gripper_close_prob)
-                
-                obs, reward, done, stats = env.step(actions)
-            else:
-                actions_chunk = np.zeros((args.num_envs, k, 8), dtype=np.float32)
-                for i in range(args.num_envs):
-                    gp = obs["gripper_pose"][i]
-                    pos = gp[:3]
-                    quat = gp[3:7]
-                    
-                    pos_seq = pos + rng.normal(0, args.pos_noise_std, size=(k, 3)).astype(np.float32)
-                    quat_seq = np.tile(quat, (k, 1))
-                    grip_seq = (rng.random(size=(k, 1)) >= args.gripper_close_prob).astype(np.float32)
-                    
-                    actions_chunk[i] = np.concatenate([pos_seq, quat_seq, grip_seq], axis=1)
+            if verbose:
+                print(f"Running {args.max_steps} steps (chunk={args.action_chunk})...", flush=True)
 
-                obs, reward, done, n_steps, stats = env.step_chunk(actions_chunk)
+            rng = np.random.default_rng(seed=0 + rank)
+            total_time = 0.0
+            s = 0
 
-            t_step = time.time() - t_start
-            total_time += t_step
-            
-            # Stats
-            exec_times = [st.get("t_exec", 0.0) for st in stats]
-            max_exec = max(exec_times) if exec_times else 0.0
-            ipc_time = t_step - max_exec
-            
-            chunk_latencies.append(t_step)
-            chunk_exec_latencies.append(max_exec)
-            chunk_ipc_latencies.append(ipc_time)
+            chunk_latencies = []
+            chunk_exec_latencies = []
+            chunk_ipc_latencies = []
+
+            done = None
+            while s < args.max_steps:
+                k = min(args.action_chunk, args.max_steps - s)
+
+                t_start = time.time()
+
+                if k == 1:
+                    actions = np.zeros((args.num_envs, 8), dtype=np.float32)
+                    for i in range(args.num_envs):
+                        actions[i] = _build_action_from_obs(obs, i, rng, args.pos_noise_std, args.gripper_close_prob)
+
+                    obs, reward, done, stats = env.step(actions)
+                else:
+                    actions_chunk = np.zeros((args.num_envs, k, 8), dtype=np.float32)
+                    for i in range(args.num_envs):
+                        gp = obs["gripper_pose"][i]
+                        pos = gp[:3]
+                        quat = gp[3:7]
+
+                        pos_seq = pos + rng.normal(0, args.pos_noise_std, size=(k, 3)).astype(np.float32)
+                        quat_seq = np.tile(quat, (k, 1))
+                        grip_seq = (rng.random(size=(k, 1)) >= args.gripper_close_prob).astype(np.float32)
+
+                        actions_chunk[i] = np.concatenate([pos_seq, quat_seq, grip_seq], axis=1)
+
+                    obs, reward, done, n_steps, stats = env.step_chunk(actions_chunk)
+
+                t_step = time.time() - t_start
+                total_time += t_step
+
+                # Stats
+                exec_times = [st.get("t_exec", 0.0) for st in stats]
+                max_exec = max(exec_times) if exec_times else 0.0
+                ipc_time = t_step - max_exec
+
+                chunk_latencies.append(t_step)
+                chunk_exec_latencies.append(max_exec)
+                chunk_ipc_latencies.append(ipc_time)
+
+                if verbose:
+                    pfx = f"[rank {rank}] " if world_size > 1 else ""
+                    print(f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
+
+                s += k
 
             if verbose:
                 pfx = f"[rank {rank}] " if world_size > 1 else ""
-                print(f"{pfx}Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
-            
-            s += k
+                print(f"{pfx}{tag} Total time: {total_time:.2f}s", flush=True)
+                print(f"{pfx}{tag} Avg Step: {np.mean(chunk_latencies):.3f}s", flush=True)
+                print(f"{pfx}{tag} Avg Exec: {np.mean(chunk_exec_latencies):.3f}s", flush=True)
+                print(f"{pfx}{tag} Avg IPC:  {np.mean(chunk_ipc_latencies):.3f}s", flush=True)
 
-        if verbose:
-            pfx = f"[rank {rank}] " if world_size > 1 else ""
-            print(f"{pfx}Total time: {total_time:.2f}s", flush=True)
-            print(f"{pfx}Avg Step: {np.mean(chunk_latencies):.3f}s", flush=True)
-            print(f"{pfx}Avg Exec: {np.mean(chunk_exec_latencies):.3f}s", flush=True)
-            print(f"{pfx}Avg IPC:  {np.mean(chunk_ipc_latencies):.3f}s", flush=True)
-            if args.output_dir and (not args.no_video) and (not args.no_rgb):
-                print(f"{pfx}Saved videos to {args.output_dir}", flush=True)
+                # RLBench's `term` is typically True when the task succeeds.
+                # We expose this as a simple "success rate" proxy here.
+                try:
+                    done_flat = np.asarray(done).reshape(-1)
+                    success_rate = float(done_flat.mean()) if done_flat.size > 0 else 0.0
+                    print(
+                        f"{pfx}{tag} Success rate (done==True): {success_rate*100:.1f}% ({int(done_flat.sum())}/{int(done_flat.size)})",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+                if args.output_dir and (not args.no_video) and (not args.no_rgb):
+                    print(f"{pfx}{tag} Saved videos to {args.output_dir}", flush=True)
+
+            return obs
+
+        if args.mode in {"bench", "debug"}:
+            _run_env_loop(tag="[bench]")
+        elif args.mode == "train":
+            # Minimal end-to-end training loop.
+            # This is not meant to be a strong RL algorithm; it's a debugging harness that:
+            # - runs env rollouts
+            # - runs a torch model forward/backward
+            # - optionally uses DDP if launched with torchrun
+            try:
+                import torch
+                import torch.nn as nn
+                import torch.optim as optim
+
+                use_cuda = torch.cuda.is_available()
+                device = torch.device("cuda", 0) if use_cuda else torch.device("cpu")
+
+                ddp_inited = False
+                if world_size > 1 and hasattr(torch, "distributed"):
+                    import torch.distributed as dist
+
+                    if not dist.is_initialized():
+                        backend = "nccl" if use_cuda else "gloo"
+                        dist.init_process_group(backend=backend, init_method="env://")
+                        ddp_inited = True
+
+                obs_dim = 8  # gripper_pose(7) + gripper_open(1)
+                # Predict delta-pos(3) and gripper logit(1)
+                out_dim = 4
+
+                class Policy(nn.Module):
+                    def __init__(self, h: int):
+                        super().__init__()
+                        self.net = nn.Sequential(
+                            nn.Linear(obs_dim, h),
+                            nn.ReLU(),
+                            nn.Linear(h, h),
+                            nn.ReLU(),
+                            nn.Linear(h, out_dim),
+                        )
+
+                    def forward(self, x):
+                        return self.net(x)
+
+                policy = Policy(int(args.train_hidden)).to(device)
+
+                if world_size > 1:
+                    from torch.nn.parallel import DistributedDataParallel as DDP
+
+                    policy = DDP(policy, device_ids=[0] if use_cuda else None)
+
+                opt = optim.Adam(policy.parameters(), lr=float(args.train_lr))
+
+                # Training loop
+                rng = np.random.default_rng(seed=1234 + rank)
+                obs = env.reset()
+
+                for upd in range(int(args.train_updates)):
+                    # Build a batch from current obs
+                    gp = obs["gripper_pose"].astype(np.float32)  # (N,7)
+                    go = obs["gripper_open"].astype(np.float32)  # (N,1)
+                    obs_low = np.concatenate([gp, go], axis=1)  # (N,8)
+
+                    # Target action (same as benchmark heuristic)
+                    target_actions = np.zeros((args.num_envs, 8), dtype=np.float32)
+                    for i in range(args.num_envs):
+                        target_actions[i] = _build_action_from_obs(obs, i, rng, args.pos_noise_std, args.gripper_close_prob)
+
+                    # Targets: delta position and gripper
+                    delta_pos_tgt = target_actions[:, :3] - gp[:, :3]
+                    gripper_tgt = target_actions[:, 7:8]
+
+                    x = torch.from_numpy(obs_low).to(device)
+                    y_delta = torch.from_numpy(delta_pos_tgt).to(device)
+                    y_grip = torch.from_numpy(gripper_tgt).to(device)
+
+                    pred = policy(x)
+                    pred_delta = pred[:, :3]
+                    pred_grip_logit = pred[:, 3:4]
+
+                    loss_delta = torch.mean((pred_delta - y_delta) ** 2)
+                    loss_grip = torch.nn.functional.binary_cross_entropy_with_logits(pred_grip_logit, y_grip)
+                    loss = loss_delta + loss_grip
+
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    opt.step()
+
+                    # Step env using the model outputs
+                    with torch.no_grad():
+                        # Clamp delta for stability
+                        delta = torch.tanh(pred_delta).cpu().numpy().astype(np.float32) * float(args.pos_noise_std)
+                        grip = (torch.sigmoid(pred_grip_logit) > 0.5).cpu().numpy().astype(np.float32)
+                        actions = np.zeros((args.num_envs, 8), dtype=np.float32)
+                        actions[:, :3] = gp[:, :3] + delta
+                        actions[:, 3:7] = gp[:, 3:7]
+                        actions[:, 7:8] = grip
+
+                    obs, reward, done, stats = env.step(actions)
+
+                    if verbose and ((upd % int(args.train_log_every)) == 0):
+                        pfx = f"[rank {rank}] " if world_size > 1 else ""
+                        print(
+                            f"{pfx}[train] update={upd} loss={float(loss.item()):.6f} loss_delta={float(loss_delta.item()):.6f} loss_grip={float(loss_grip.item()):.6f}",
+                            flush=True,
+                        )
+
+                # Save ckpt (rank0 only)
+                if args.train_ckpt and rank == 0:
+                    to_save = policy.module.state_dict() if hasattr(policy, "module") else policy.state_dict()
+                    torch.save({"state_dict": to_save, "args": vars(args)}, str(args.train_ckpt))
+                    print(f"[train] saved checkpoint to {args.train_ckpt}", flush=True)
+
+                # Clean up DDP
+                if world_size > 1 and ddp_inited:
+                    import torch.distributed as dist
+
+                    dist.destroy_process_group()
+
+                # After training, optionally run a benchmark loop if videos are enabled
+                if args.output_dir and (not args.no_video) and (not args.no_rgb):
+                    _run_env_loop(tag="[debug_after_train]")
+
+            except ImportError as e:
+                raise RuntimeError(
+                    "mode=train requires PyTorch installed in your environment (import torch failed)."
+                ) from e
 
     except Exception:
         print("\n" + "="*60, file=sys.stderr)
