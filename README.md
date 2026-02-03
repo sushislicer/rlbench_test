@@ -117,13 +117,39 @@ This adds small overhead (extra timers and extra stats sent back from workers), 
   - `obs`: time copying observations into shared memory
   - `vid`: video encode/write time (when enabled)
   - `toggle`: time toggling camera RGB flags for `--video_stride`
+  - `cpu`/`util`: worker CPU time and CPU utilization estimate (`cpu/util = process_time / wall_time`)
   - `other`: any remaining worker-side overhead
   - `ipc`: computed as `total - exec` on the main side (Pipe + scheduling + copies outside worker timing)
+
+In addition, the per-chunk log prints quick distribution stats across envs (`p50/p90/p99`) for:
+- `exec` (worker wall time)
+- `sim` (time in `task_env.step`)
+- `cpu_util` (CPU utilization)
+
+These are useful for spotting stragglers (e.g. one env much slower than the rest).
 
 Example:
 
 ```bash
 python rl_vec_env.py --num_envs 64 --max_steps 100 --task_class sweep_to_dustpan --action_chunk 54 --profile_timing
+```
+
+### Reducing `sim` time when only recording env0
+If you enable video but (by default) only record env0, you usually still don’t want *all* envs to render RGB.
+
+Use `--rgb_video_only` to keep RGB cameras enabled **only** on the workers that actually record videos; all other workers will run with RGB disabled to reduce `sim` time.
+
+Example:
+
+```bash
+python rl_vec_env.py \
+  --num_envs 64 \
+  --max_steps 100 \
+  --task_class sweep_to_dustpan \
+  --action_chunk 54 \
+  --output_dir rlbench_vec_env_videos \
+  --profile_timing \
+  --rgb_video_only
 ```
 
 ### End-to-end training loop (pipeline debug)
@@ -163,6 +189,7 @@ python rl_vec_env.py \
 - `--fast`: Preset for throughput benchmarking (`--arm_mode ik --no_rgb --no_video --idle_fps 0`).
 - `--no_rgb`: Disable camera RGB (major speedup).
 - `--no_video`: Disable video recording.
+- `--rgb_video_only`: When video is enabled, only video-recording workers keep RGB cameras enabled.
 - `--render_backend`: `xvfb` (default), `egl` (no X server), `external` (use an existing DISPLAY).
 
 ## Troubleshooting

@@ -250,22 +250,32 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         output_dir = env_config.get("output_dir", None)
         video_all = env_config.get("video_all", False)
         no_video = env_config.get("no_video", False)
-        enable_rgb = bool(env_config.get("enable_rgb", True))
+        enable_rgb_cfg = bool(env_config.get("enable_rgb", True))
         video_stride = max(1, int(env_config.get("video_stride", 1)))
         profile_timing = bool(env_config.get("profile_timing", False))
+        rgb_video_only = bool(env_config.get("rgb_video_only", False))
 
         # Torchrun ranks (for controlling which process writes videos)
         global_rank = int(env_config.get("global_rank", 0))
         video_rank0_only = bool(env_config.get("video_rank0_only", False))
-        
-        # Video recording requires RGB observations.
-        if (
+
+        # Decide whether this worker will record video.
+        # We use this both to decide whether to open a VideoWriter, and (optionally)
+        # to disable RGB cameras for non-video workers to reduce sim/render load.
+        want_video = bool(
             output_dir
             and (not no_video)
-            and enable_rgb
+            and enable_rgb_cfg
             and ((not video_rank0_only) or (global_rank == 0))
             and (rank == 0 or video_all)
-        ):
+        )
+
+        # If enabled, only keep RGB cameras on for the workers that actually record video.
+        # This can drastically reduce `task_env.step()` time when running many envs.
+        enable_rgb = bool(enable_rgb_cfg and ((not rgb_video_only) or want_video))
+        
+        # Video recording requires RGB observations.
+        if want_video:
             os.makedirs(output_dir, exist_ok=True)
             f_front = os.path.join(output_dir, f"env{rank}_front.mp4")
             f_wrist = os.path.join(output_dir, f"env{rank}_wrist.mp4")
@@ -367,6 +377,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 t_sim = 0.0
                 t_obs_write = 0.0
                 t_video = 0.0
+                cpu0 = time.process_time() if profile_timing else 0.0
+                n_steps = 0
                 if done_flag:
                     arrays["done"][0] = True
                     arrays["reward"][0] = 0.0
@@ -388,6 +400,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         obs, reward, term = task_env.step(data)
                         if profile_timing:
                             t_sim += time.perf_counter() - _t
+                        n_steps = 1
                         step_idx += 1
 
                         if profile_timing:
@@ -419,15 +432,20 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         arrays["done"][0] = False
                 t_exec = time.perf_counter() - t0
                 if profile_timing:
+                    t_cpu = float(time.process_time() - cpu0)
+                    cpu_util = float(t_cpu / t_exec) if t_exec > 0 else 0.0
                     pipe.send(
                         (
                             "done",
                             {
                                 "t_exec": float(t_exec),
+                                "n_steps": int(n_steps),
                                 "t_toggle": float(t_toggle),
                                 "t_sim": float(t_sim),
                                 "t_obs_write": float(t_obs_write),
                                 "t_video": float(t_video),
+                                "t_cpu": float(t_cpu),
+                                "cpu_util": float(cpu_util),
                             },
                         )
                     )
@@ -440,6 +458,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 t_sim = 0.0
                 t_obs_write = 0.0
                 t_video = 0.0
+                cpu0 = time.process_time() if profile_timing else 0.0
                 # data is actions (K, 8)
                 if done_flag:
                     arrays["reward_sum"][0] = 0.0
@@ -457,6 +476,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                                     "t_sim": 0.0,
                                     "t_obs_write": 0.0,
                                     "t_video": 0.0,
+                                    "t_cpu": 0.0,
+                                    "cpu_util": 0.0,
                                 },
                             )
                         )
@@ -531,6 +552,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 arrays["done"][0] = bool(done_flag)
                 t_exec = time.perf_counter() - t0
                 if profile_timing:
+                    t_cpu = float(time.process_time() - cpu0)
+                    cpu_util = float(t_cpu / t_exec) if t_exec > 0 else 0.0
                     pipe.send(
                         (
                             "done",
@@ -541,6 +564,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                                 "t_sim": float(t_sim),
                                 "t_obs_write": float(t_obs_write),
                                 "t_video": float(t_video),
+                                "t_cpu": float(t_cpu),
+                                "cpu_util": float(cpu_util),
                             },
                         )
                     )
@@ -632,6 +657,7 @@ class RLBenchVectorEnv:
         global_rank=0,
         video_rank0_only=False,
         profile_timing: bool = False,
+        rgb_video_only: bool = False,
     ):
         self.num_envs = num_envs
         self.verbose = bool(verbose)
@@ -695,6 +721,7 @@ class RLBenchVectorEnv:
             "global_rank": int(global_rank),
             "video_rank0_only": bool(video_rank0_only),
             "profile_timing": bool(profile_timing),
+            "rgb_video_only": bool(rgb_video_only),
         }
         
         if self.verbose:
@@ -832,6 +859,15 @@ def main():
         default=1,
         help="Write every Nth frame to the video (reduces encode load). Only applies when video is enabled.",
     )
+    parser.add_argument(
+        "--rgb_video_only",
+        action="store_true",
+        help=(
+            "If video is enabled, only the workers that actually record videos keep RGB cameras enabled. "
+            "Non-video workers run with RGB disabled to reduce sim/render time. "
+            "(Has no effect if --no_rgb is set.)"
+        ),
+    )
     parser.add_argument("--no_rgb", action="store_true", help="Disable RGB observations (major speedup)")
     parser.add_argument("--collision_checking", action="store_true", help="Enable collision checking in action mode (slower)")
     parser.add_argument("--realtime", action="store_true", help="Run CoppeliaSim in real-time (slower). Default: as-fast-as-possible")
@@ -896,7 +932,7 @@ def main():
         "--profile_timing",
         action="store_true",
         help=(
-            "Collect a more detailed timing breakdown per env-step/chunk (worker-side: sim/obs-copy/video/toggle; "
+            "Collect a more detailed timing breakdown per env-step/chunk (worker-side: sim/obs-copy/video/toggle/cpu_util; "
             "main-side: action-build vs env-call). Adds small overhead; intended for profiling/optimization."
         ),
     )
@@ -1060,6 +1096,7 @@ def main():
             global_rank=int(rank),
             video_rank0_only=bool(getattr(args, "video_rank0_only", False)),
             profile_timing=bool(getattr(args, "profile_timing", False)),
+            rgb_video_only=bool(getattr(args, "rgb_video_only", False)),
         )
 
         def _run_env_loop(*, tag: str):
@@ -1090,6 +1127,8 @@ def main():
             chunk_video_latencies = []
             chunk_toggle_latencies = []
             chunk_other_exec_latencies = []
+            chunk_sim_step_latencies = []
+            chunk_cpu_util_latencies = []
 
             done = None
             while s < args.max_steps:
@@ -1141,11 +1180,37 @@ def main():
                     else:
                         idx_max = -1
                         st_max = {}
+
+                    exec_arr = np.asarray(exec_times, dtype=np.float64) if len(exec_times) > 0 else np.asarray([], dtype=np.float64)
+                    sim_arr = np.asarray([st.get("t_sim", 0.0) for st in stats], dtype=np.float64) if len(stats) > 0 else np.asarray([], dtype=np.float64)
+                    cpu_util_arr = np.asarray([st.get("cpu_util", 0.0) for st in stats], dtype=np.float64) if len(stats) > 0 else np.asarray([], dtype=np.float64)
+
+                    if exec_arr.size > 0:
+                        exec_p50, exec_p90, exec_p99 = np.percentile(exec_arr, [50, 90, 99]).tolist()
+                    else:
+                        exec_p50 = exec_p90 = exec_p99 = 0.0
+                    if sim_arr.size > 0:
+                        sim_p50, sim_p90, sim_p99 = np.percentile(sim_arr, [50, 90, 99]).tolist()
+                    else:
+                        sim_p50 = sim_p90 = sim_p99 = 0.0
+                    if cpu_util_arr.size > 0:
+                        cu_p50, cu_p90, cu_p99 = np.percentile(cpu_util_arr, [50, 90, 99]).tolist()
+                    else:
+                        cu_p50 = cu_p90 = cu_p99 = 0.0
+
                     t_sim = float(st_max.get("t_sim", 0.0))
                     t_obs = float(st_max.get("t_obs_write", 0.0))
                     t_vid = float(st_max.get("t_video", 0.0))
                     t_tog = float(st_max.get("t_toggle", 0.0))
+                    t_cpu = float(st_max.get("t_cpu", 0.0))
+                    cpu_util = float(st_max.get("cpu_util", 0.0))
                     t_other = max(0.0, float(max_exec) - (t_sim + t_obs + t_vid + t_tog))
+
+                    n_steps_crit = int(st_max.get("n_steps", 0))
+                    if n_steps_crit <= 0:
+                        # Fallback (shouldn't normally be needed since workers now return n_steps)
+                        n_steps_crit = int(k)
+                    sim_per_step = float(t_sim / n_steps_crit) if n_steps_crit > 0 else 0.0
 
                     chunk_build_latencies.append(float(t_build))
                     chunk_envcall_latencies.append(float(t_envcall))
@@ -1154,6 +1219,8 @@ def main():
                     chunk_video_latencies.append(float(t_vid))
                     chunk_toggle_latencies.append(float(t_tog))
                     chunk_other_exec_latencies.append(float(t_other))
+                    chunk_sim_step_latencies.append(float(sim_per_step))
+                    chunk_cpu_util_latencies.append(float(cpu_util))
 
                 chunk_latencies.append(t_step)
                 chunk_exec_latencies.append(max_exec)
@@ -1165,7 +1232,11 @@ def main():
                         print(
                             f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s "
                             f"build={t_build:.3f}s env_call={t_envcall:.3f}s "
-                            f"exec={max_exec:.3f}s(sim={t_sim:.3f}s obs={t_obs:.3f}s vid={t_vid:.3f}s toggle={t_tog:.3f}s other={t_other:.3f}s) "
+                            f"exec={max_exec:.3f}s(sim={t_sim:.3f}s obs={t_obs:.3f}s vid={t_vid:.3f}s toggle={t_tog:.3f}s other={t_other:.3f}s "
+                            f"cpu={t_cpu:.3f}s util={cpu_util*100:.0f}% sim/step={sim_per_step:.3f}s) "
+                            f"dist_exec(p50/p90/p99)={exec_p50:.3f}/{exec_p90:.3f}/{exec_p99:.3f}s "
+                            f"dist_sim(p50/p90/p99)={sim_p50:.3f}/{sim_p90:.3f}/{sim_p99:.3f}s "
+                            f"dist_cpu_util(p50/p90/p99)={cu_p50*100:.0f}/{cu_p90*100:.0f}/{cu_p99*100:.0f}% "
                             f"ipc={ipc_time:.3f}s",
                             flush=True,
                         )
@@ -1193,6 +1264,11 @@ def main():
                         f"{pfx}{tag} Avg Exec Breakdown (critical env): sim={np.mean(chunk_sim_latencies):.3f}s "
                         f"obs={np.mean(chunk_obs_latencies):.3f}s vid={np.mean(chunk_video_latencies):.3f}s "
                         f"toggle={np.mean(chunk_toggle_latencies):.3f}s other={np.mean(chunk_other_exec_latencies):.3f}s",
+                        flush=True,
+                    )
+                    print(
+                        f"{pfx}{tag} Avg Sim/Step (critical env): {np.mean(chunk_sim_step_latencies):.3f}s  "
+                        f"Avg CPU util (critical env): {np.mean(chunk_cpu_util_latencies)*100:.0f}%",
                         flush=True,
                     )
 
