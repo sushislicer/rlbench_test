@@ -492,11 +492,18 @@ def main():
     if coppelia_root and os.path.isdir(coppelia_root):
         ld_path = os.environ.get("LD_LIBRARY_PATH", "")
         if coppelia_root not in ld_path:
-            print(f"Auto-adding {coppelia_root} to LD_LIBRARY_PATH", flush=True)
-            os.environ["LD_LIBRARY_PATH"] = f"{ld_path}:{coppelia_root}" if ld_path else coppelia_root
-        
-        if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
-             os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = coppelia_root
+            print(f"Auto-adding {coppelia_root} to LD_LIBRARY_PATH and restarting...", flush=True)
+            
+            new_ld_path = f"{ld_path}:{coppelia_root}" if ld_path else coppelia_root
+            os.environ["LD_LIBRARY_PATH"] = new_ld_path
+            
+            if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
+                 os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = coppelia_root
+            
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as e:
+                print(f"Failed to restart process: {e}", flush=True)
 
     print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
