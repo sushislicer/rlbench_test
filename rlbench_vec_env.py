@@ -416,9 +416,10 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             # QT_QPA_PLATFORM=offscreen, Qt will load the wrong plugin and you may get:
             #   "This plugin does not support createPlatformOpenGLContext!"
             # Force a sane EGL-capable default.
-            # "offscreen" often lacks GL integration. "minimalegl" is preferred for EGL.
-            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "minimalegl"
-            qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "egl" # or "desktop"
+            # "offscreen" is the standard Qt headless platform.
+            # Debugging confirmed "offscreen" + "desktop" works on this system, while "minimalegl" fails.
+            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "offscreen"
+            qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "desktop"
             qt_xcb = _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none"
             pyopengl = _norm_opt_str(env_config.get("pyopengl_platform")) or "egl"
 
