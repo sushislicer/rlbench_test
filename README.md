@@ -105,6 +105,27 @@ By default, videos are recorded only for env 0; use `--video_all` to record all 
 
 [`mp_rlbench_env_test.py`](mp_rlbench_env_test.py:1) prints per-chunk progress (`done=...`) and average return, and always writes videos for all envs.
 
+### Profiling / time breakdown
+For optimization work, you can enable a more detailed timing breakdown with `--profile_timing` in [`rl_vec_env.py`](rl_vec_env.py:1).
+
+This adds small overhead (extra timers and extra stats sent back from workers), but it breaks down where time is spent:
+- **Main process**:
+  - `build`: action construction time
+  - `env_call`: wall time spent inside `env.step(...)` / `env.step_chunk(...)`
+- **Worker process (critical path env)**:
+  - `sim`: time inside RLBench `task_env.step(...)`
+  - `obs`: time copying observations into shared memory
+  - `vid`: video encode/write time (when enabled)
+  - `toggle`: time toggling camera RGB flags for `--video_stride`
+  - `other`: any remaining worker-side overhead
+  - `ipc`: computed as `total - exec` on the main side (Pipe + scheduling + copies outside worker timing)
+
+Example:
+
+```bash
+python rl_vec_env.py --num_envs 64 --max_steps 100 --task_class sweep_to_dustpan --action_chunk 54 --profile_timing
+```
+
 ### End-to-end training loop (pipeline debug)
 If you want a minimal end-to-end loop (env + torch forward/backward) to validate distributed launch and throughput:
 

@@ -252,6 +252,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         no_video = env_config.get("no_video", False)
         enable_rgb = bool(env_config.get("enable_rgb", True))
         video_stride = max(1, int(env_config.get("video_stride", 1)))
+        profile_timing = bool(env_config.get("profile_timing", False))
 
         # Torchrun ranks (for controlling which process writes videos)
         global_rank = int(env_config.get("global_rank", 0))
@@ -362,6 +363,10 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 
             elif cmd == "step":
                 t0 = time.perf_counter()
+                t_toggle = 0.0
+                t_sim = 0.0
+                t_obs_write = 0.0
+                t_video = 0.0
                 if done_flag:
                     arrays["done"][0] = True
                     arrays["reward"][0] = 0.0
@@ -370,16 +375,42 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         if enable_rgb and (vw_front is not None or vw_wrist is not None):
                             want_frame = (step_idx % video_stride) == 0
                             try:
+                                if profile_timing:
+                                    _t = time.perf_counter()
                                 obs_config.front_camera.rgb = want_frame
                                 obs_config.wrist_camera.rgb = want_frame
+                                if profile_timing:
+                                    t_toggle += time.perf_counter() - _t
                             except Exception:
                                 pass
 
+                        _t = time.perf_counter()
                         obs, reward, term = task_env.step(data)
+                        if profile_timing:
+                            t_sim += time.perf_counter() - _t
                         step_idx += 1
-                        _write_obs(arrays, obs)
-                        if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
-                        if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
+
+                        if profile_timing:
+                            _t = time.perf_counter()
+                            _write_obs(arrays, obs)
+                            t_obs_write += time.perf_counter() - _t
+                        else:
+                            _write_obs(arrays, obs)
+
+                        if vw_front and hasattr(obs, "front_rgb"):
+                            if profile_timing:
+                                _t = time.perf_counter()
+                                _write_video(vw_front, obs.front_rgb)
+                                t_video += time.perf_counter() - _t
+                            else:
+                                _write_video(vw_front, obs.front_rgb)
+                        if vw_wrist and hasattr(obs, "wrist_rgb"):
+                            if profile_timing:
+                                _t = time.perf_counter()
+                                _write_video(vw_wrist, obs.wrist_rgb)
+                                t_video += time.perf_counter() - _t
+                            else:
+                                _write_video(vw_wrist, obs.wrist_rgb)
                         arrays["reward"][0] = reward
                         arrays["done"][0] = term
                         done_flag = bool(term)
@@ -387,17 +418,50 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         arrays["reward"][0] = 0.0
                         arrays["done"][0] = False
                 t_exec = time.perf_counter() - t0
-                pipe.send(("done", {"t_exec": t_exec}))
+                if profile_timing:
+                    pipe.send(
+                        (
+                            "done",
+                            {
+                                "t_exec": float(t_exec),
+                                "t_toggle": float(t_toggle),
+                                "t_sim": float(t_sim),
+                                "t_obs_write": float(t_obs_write),
+                                "t_video": float(t_video),
+                            },
+                        )
+                    )
+                else:
+                    pipe.send(("done", {"t_exec": t_exec}))
             
             elif cmd == "step_chunk":
                 t0 = time.perf_counter()
+                t_toggle = 0.0
+                t_sim = 0.0
+                t_obs_write = 0.0
+                t_video = 0.0
                 # data is actions (K, 8)
                 if done_flag:
                     arrays["reward_sum"][0] = 0.0
                     arrays["n_steps"][0] = 0
                     arrays["reward"][0] = 0.0
                     arrays["done"][0] = True
-                    pipe.send(("done", {"t_exec": 0.0}))
+                    if profile_timing:
+                        pipe.send(
+                            (
+                                "done",
+                                {
+                                    "t_exec": 0.0,
+                                    "n_steps": 0,
+                                    "t_toggle": 0.0,
+                                    "t_sim": 0.0,
+                                    "t_obs_write": 0.0,
+                                    "t_video": 0.0,
+                                },
+                            )
+                        )
+                    else:
+                        pipe.send(("done", {"t_exec": 0.0}))
                     continue
                 
                 actions = data
@@ -413,19 +477,38 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         if enable_rgb and (vw_front is not None or vw_wrist is not None):
                             want_frame = (step_idx % video_stride) == 0
                             try:
+                                if profile_timing:
+                                    _t = time.perf_counter()
                                 obs_config.front_camera.rgb = want_frame
                                 obs_config.wrist_camera.rgb = want_frame
+                                if profile_timing:
+                                    t_toggle += time.perf_counter() - _t
                             except Exception:
                                 pass
 
+                        _t = time.perf_counter()
                         obs, reward, term = task_env.step(actions[j])
+                        if profile_timing:
+                            t_sim += time.perf_counter() - _t
                         step_idx += 1
                         last_reward = float(reward)
                         reward_sum += float(reward)
                         n_steps += 1
                         
-                        if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
-                        if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
+                        if vw_front and hasattr(obs, "front_rgb"):
+                            if profile_timing:
+                                _t = time.perf_counter()
+                                _write_video(vw_front, obs.front_rgb)
+                                t_video += time.perf_counter() - _t
+                            else:
+                                _write_video(vw_front, obs.front_rgb)
+                        if vw_wrist and hasattr(obs, "wrist_rgb"):
+                            if profile_timing:
+                                _t = time.perf_counter()
+                                _write_video(vw_wrist, obs.wrist_rgb)
+                                t_video += time.perf_counter() - _t
+                            else:
+                                _write_video(vw_wrist, obs.wrist_rgb)
                         if bool(term):
                             done_flag = True
                             break
@@ -435,14 +518,34 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         pass
                 
                 if obs is not None:
-                    _write_obs(arrays, obs)
+                    if profile_timing:
+                        _t = time.perf_counter()
+                        _write_obs(arrays, obs)
+                        t_obs_write += time.perf_counter() - _t
+                    else:
+                        _write_obs(arrays, obs)
                 
                 arrays["reward_sum"][0] = float(reward_sum)
                 arrays["n_steps"][0] = int(n_steps)
                 arrays["reward"][0] = float(last_reward)
                 arrays["done"][0] = bool(done_flag)
                 t_exec = time.perf_counter() - t0
-                pipe.send(("done", {"t_exec": t_exec}))
+                if profile_timing:
+                    pipe.send(
+                        (
+                            "done",
+                            {
+                                "t_exec": float(t_exec),
+                                "n_steps": int(n_steps),
+                                "t_toggle": float(t_toggle),
+                                "t_sim": float(t_sim),
+                                "t_obs_write": float(t_obs_write),
+                                "t_video": float(t_video),
+                            },
+                        )
+                    )
+                else:
+                    pipe.send(("done", {"t_exec": t_exec}))
                 
             elif cmd == "close":
                 break
@@ -528,6 +631,7 @@ class RLBenchVectorEnv:
         video_stride=1,
         global_rank=0,
         video_rank0_only=False,
+        profile_timing: bool = False,
     ):
         self.num_envs = num_envs
         self.verbose = bool(verbose)
@@ -590,6 +694,7 @@ class RLBenchVectorEnv:
             "video_stride": int(video_stride),
             "global_rank": int(global_rank),
             "video_rank0_only": bool(video_rank0_only),
+            "profile_timing": bool(profile_timing),
         }
         
         if self.verbose:
@@ -787,6 +892,15 @@ def main():
         help="Print per-worker startup logs (very noisy for many envs)",
     )
 
+    parser.add_argument(
+        "--profile_timing",
+        action="store_true",
+        help=(
+            "Collect a more detailed timing breakdown per env-step/chunk (worker-side: sim/obs-copy/video/toggle; "
+            "main-side: action-build vs env-call). Adds small overhead; intended for profiling/optimization."
+        ),
+    )
+
     # Minimal training loop settings (mode=train)
     parser.add_argument("--train_updates", type=int, default=10, help="Number of optimizer updates")
     parser.add_argument("--train_lr", type=float, default=3e-4, help="Learning rate")
@@ -864,11 +978,15 @@ def main():
         # Common pitfall: --num_envs is PER RANK; total envs = num_envs * world_size
         print(f"[DDP] WARNING: --num_envs is per-rank. Total envs = {int(args.num_envs) * int(world_size)}", flush=True)
     
-    # Handle aliases
-    if args.max_steps != 100 and args.steps == 100:
-        pass # max_steps set
-    elif args.steps != 100:
-        args.max_steps = args.steps
+    # Handle aliases.
+    # NOTE: Some older copies of this script referenced args.steps without
+    # defining it in argparse (causing AttributeError). Keep this robust by
+    # using getattr().
+    steps_arg = int(getattr(args, "steps", 100))
+    if args.max_steps != 100 and steps_arg == 100:
+        pass  # max_steps set
+    elif steps_arg != 100:
+        args.max_steps = steps_arg
         
     # Auto-configure CoppeliaSim environment
     coppelia_root = os.environ.get("COPPELIASIM_ROOT")
@@ -941,6 +1059,7 @@ def main():
             pyopengl_platform=getattr(args, "pyopengl_platform", None),
             global_rank=int(rank),
             video_rank0_only=bool(getattr(args, "video_rank0_only", False)),
+            profile_timing=bool(getattr(args, "profile_timing", False)),
         )
 
         def _run_env_loop(*, tag: str):
@@ -963,18 +1082,31 @@ def main():
             chunk_exec_latencies = []
             chunk_ipc_latencies = []
 
+            # Optional profiling breakdown
+            chunk_build_latencies = []
+            chunk_envcall_latencies = []
+            chunk_sim_latencies = []
+            chunk_obs_latencies = []
+            chunk_video_latencies = []
+            chunk_toggle_latencies = []
+            chunk_other_exec_latencies = []
+
             done = None
             while s < args.max_steps:
                 k = min(args.action_chunk, args.max_steps - s)
 
-                t_start = time.time()
+                t_start = time.perf_counter()
+                t_build0 = time.perf_counter()
 
                 if k == 1:
                     actions = np.zeros((args.num_envs, 8), dtype=np.float32)
                     for i in range(args.num_envs):
                         actions[i] = _build_action_from_obs(obs, i, rng, args.pos_noise_std, args.gripper_close_prob)
 
+                    t_build = time.perf_counter() - t_build0
+                    t_env0 = time.perf_counter()
                     obs, reward, done, stats = env.step(actions)
+                    t_envcall = time.perf_counter() - t_env0
                 else:
                     actions_chunk = np.zeros((args.num_envs, k, 8), dtype=np.float32)
                     for i in range(args.num_envs):
@@ -988,9 +1120,12 @@ def main():
 
                         actions_chunk[i] = np.concatenate([pos_seq, quat_seq, grip_seq], axis=1)
 
+                    t_build = time.perf_counter() - t_build0
+                    t_env0 = time.perf_counter()
                     obs, reward, done, n_steps, stats = env.step_chunk(actions_chunk)
+                    t_envcall = time.perf_counter() - t_env0
 
-                t_step = time.time() - t_start
+                t_step = time.perf_counter() - t_start
                 total_time += t_step
 
                 # Stats
@@ -998,13 +1133,47 @@ def main():
                 max_exec = max(exec_times) if exec_times else 0.0
                 ipc_time = t_step - max_exec
 
+                if bool(getattr(args, "profile_timing", False)):
+                    # Choose the env on the critical path (max worker exec time) and read its breakdown.
+                    if len(exec_times) > 0:
+                        idx_max = int(np.argmax(np.asarray(exec_times, dtype=np.float64)))
+                        st_max = stats[idx_max] if idx_max < len(stats) else {}
+                    else:
+                        idx_max = -1
+                        st_max = {}
+                    t_sim = float(st_max.get("t_sim", 0.0))
+                    t_obs = float(st_max.get("t_obs_write", 0.0))
+                    t_vid = float(st_max.get("t_video", 0.0))
+                    t_tog = float(st_max.get("t_toggle", 0.0))
+                    t_other = max(0.0, float(max_exec) - (t_sim + t_obs + t_vid + t_tog))
+
+                    chunk_build_latencies.append(float(t_build))
+                    chunk_envcall_latencies.append(float(t_envcall))
+                    chunk_sim_latencies.append(float(t_sim))
+                    chunk_obs_latencies.append(float(t_obs))
+                    chunk_video_latencies.append(float(t_vid))
+                    chunk_toggle_latencies.append(float(t_tog))
+                    chunk_other_exec_latencies.append(float(t_other))
+
                 chunk_latencies.append(t_step)
                 chunk_exec_latencies.append(max_exec)
                 chunk_ipc_latencies.append(ipc_time)
 
                 if verbose:
                     pfx = f"[rank {rank}] " if world_size > 1 else ""
-                    print(f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
+                    if bool(getattr(args, "profile_timing", False)):
+                        print(
+                            f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s "
+                            f"build={t_build:.3f}s env_call={t_envcall:.3f}s "
+                            f"exec={max_exec:.3f}s(sim={t_sim:.3f}s obs={t_obs:.3f}s vid={t_vid:.3f}s toggle={t_tog:.3f}s other={t_other:.3f}s) "
+                            f"ipc={ipc_time:.3f}s",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s",
+                            flush=True,
+                        )
 
                 s += k
 
@@ -1014,6 +1183,18 @@ def main():
                 print(f"{pfx}{tag} Avg Step: {np.mean(chunk_latencies):.3f}s", flush=True)
                 print(f"{pfx}{tag} Avg Exec: {np.mean(chunk_exec_latencies):.3f}s", flush=True)
                 print(f"{pfx}{tag} Avg IPC:  {np.mean(chunk_ipc_latencies):.3f}s", flush=True)
+
+                if bool(getattr(args, "profile_timing", False)) and len(chunk_build_latencies) > 0:
+                    print(
+                        f"{pfx}{tag} Avg Build: {np.mean(chunk_build_latencies):.3f}s  Avg EnvCall: {np.mean(chunk_envcall_latencies):.3f}s",
+                        flush=True,
+                    )
+                    print(
+                        f"{pfx}{tag} Avg Exec Breakdown (critical env): sim={np.mean(chunk_sim_latencies):.3f}s "
+                        f"obs={np.mean(chunk_obs_latencies):.3f}s vid={np.mean(chunk_video_latencies):.3f}s "
+                        f"toggle={np.mean(chunk_toggle_latencies):.3f}s other={np.mean(chunk_other_exec_latencies):.3f}s",
+                        flush=True,
+                    )
 
                 # RLBench's `term` is typically True when the task succeeds.
                 # We expose this as a simple "success rate" proxy here.
