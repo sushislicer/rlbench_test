@@ -128,7 +128,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         os.makedirs(home_dir, exist_ok=True)
         os.environ["HOME"] = home_dir
 
-        print(f"[Worker {rank}] Starting Xvfb on {display}...", flush=True)
+        if env_config.get("worker_log", False):
+            print(f"[Worker {rank}] Starting Xvfb on {display}...", flush=True)
 
         # 2. Import RLBench (must be after DISPLAY set)
         from rlbench.environment import Environment
@@ -212,7 +213,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             headless=True,
             robot_setup=env_config["robot_setup"]
         )
-        print(f"[Worker {rank}] Launching RLBench...", flush=True)
+        if env_config.get("worker_log", False):
+            print(f"[Worker {rank}] Launching RLBench...", flush=True)
         env.launch()
 
         # Disable real-time throttling so simulation runs as fast as possible.
@@ -247,7 +249,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             arrays[name] = full_arr[rank]
 
         # 5. Loop
-        print(f"[Worker {rank}] Ready.", flush=True)
+        if env_config.get("worker_log", False):
+            print(f"[Worker {rank}] Ready.", flush=True)
         pipe.send("ready")
         
         done_flag = False
@@ -405,8 +408,11 @@ class RLBenchVectorEnv:
         collision_checking=False,
         realtime=False,
         idle_fps=0,
+        verbose=True,
+        worker_log=False,
     ):
         self.num_envs = num_envs
+        self.verbose = bool(verbose)
         self.shm_specs = {
             "front_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
             "wrist_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
@@ -450,9 +456,11 @@ class RLBenchVectorEnv:
             "collision_checking": collision_checking,
             "realtime": realtime,
             "idle_fps": idle_fps,
+            "worker_log": bool(worker_log),
         }
         
-        print(f"Starting {num_envs} workers...", flush=True)
+        if self.verbose:
+            print(f"Starting {num_envs} workers...", flush=True)
         for i in range(num_envs):
             parent, child = ctx.Pipe()
             p = ctx.Process(target=_worker_entry, args=(i, child, self.shm_info, env_config))
@@ -467,7 +475,8 @@ class RLBenchVectorEnv:
                 if isinstance(msg, tuple) and msg[0] == "error":
                     raise RuntimeError(f"Worker {i} failed:\n{msg[1]}")
                 raise RuntimeError(f"Worker {i} failed: {msg}")
-        print("All workers ready.", flush=True)
+        if self.verbose:
+            print("All workers ready.", flush=True)
 
     def reset(self):
         for pipe in self.pipes:
@@ -511,7 +520,8 @@ class RLBenchVectorEnv:
         # Unregister to avoid double call
         atexit.unregister(self.close)
         
-        print("[RLBenchVecEnv] Closing...", flush=True)
+        if self.verbose:
+            print("[RLBenchVecEnv] Closing...", flush=True)
         for pipe in self.pipes:
             try: pipe.send(("close", None))
             except: pass
@@ -526,7 +536,8 @@ class RLBenchVectorEnv:
         for shm in self.shm_objs:
             try: shm.close(); shm.unlink()
             except: pass
-        print("[RLBenchVecEnv] Closed.", flush=True)
+        if self.verbose:
+            print("[RLBenchVecEnv] Closed.", flush=True)
 
 def _build_action_from_obs(obs_dict, idx, rng, pos_noise_std=0.01, gripper_close_prob=0.05):
     gp = obs_dict["gripper_pose"][idx] # (7,)
@@ -579,6 +590,16 @@ def main():
         action="store_true",
         help="If launched with torchrun, set CUDA_VISIBLE_DEVICES=LOCAL_RANK for each rank (helps GPU isolation)",
     )
+    parser.add_argument(
+        "--log_all_ranks",
+        action="store_true",
+        help="Print benchmark logs from all torchrun ranks (default: only rank 0)",
+    )
+    parser.add_argument(
+        "--worker_log",
+        action="store_true",
+        help="Print per-worker startup logs (very noisy for many envs)",
+    )
     
     args, _ = parser.parse_known_args()
 
@@ -595,7 +616,8 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = _get_local_rank()
-    if world_size > 1:
+    verbose = (world_size == 1) or bool(getattr(args, "log_all_ranks", False)) or (rank == 0)
+    if world_size > 1 and verbose:
         print(f"[DDP] world_size={world_size} rank={rank} local_rank={local_rank}", flush=True)
 
     # Optionally bind each rank to a single GPU.
@@ -645,8 +667,9 @@ def main():
             except Exception as e:
                 print(f"Failed to restart process: {e}", flush=True)
 
-    print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
-    print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
+    if verbose:
+        print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
+        print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
     try:
         env = RLBenchVectorEnv(
@@ -663,15 +686,20 @@ def main():
             collision_checking=args.collision_checking,
             realtime=args.realtime,
             idle_fps=args.idle_fps,
+            verbose=verbose,
+            worker_log=bool(getattr(args, "worker_log", False)),
         )
 
-        print("Resetting...", flush=True)
+        if verbose:
+            print("Resetting...", flush=True)
         t0 = time.time()
         obs = env.reset()
         t_reset = time.time() - t0
-        print(f"Reset done in {t_reset:.2f}s", flush=True)
+        if verbose:
+            print(f"Reset done in {t_reset:.2f}s", flush=True)
 
-        print(f"Running {args.max_steps} steps (chunk={args.action_chunk})...", flush=True)
+        if verbose:
+            print(f"Running {args.max_steps} steps (chunk={args.action_chunk})...", flush=True)
         
         rng = np.random.default_rng(seed=0)
         total_time = 0.0
@@ -719,15 +747,20 @@ def main():
             chunk_exec_latencies.append(max_exec)
             chunk_ipc_latencies.append(ipc_time)
 
-            print(f"Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
+            if verbose:
+                pfx = f"[rank {rank}] " if world_size > 1 else ""
+                print(f"{pfx}Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
             
             s += k
 
-        print(f"Total time: {total_time:.2f}s", flush=True)
-        print(f"Avg Step: {np.mean(chunk_latencies):.3f}s", flush=True)
-        print(f"Avg Exec: {np.mean(chunk_exec_latencies):.3f}s", flush=True)
-        print(f"Avg IPC:  {np.mean(chunk_ipc_latencies):.3f}s", flush=True)
-        print(f"Saved videos to {args.output_dir}", flush=True)
+        if verbose:
+            pfx = f"[rank {rank}] " if world_size > 1 else ""
+            print(f"{pfx}Total time: {total_time:.2f}s", flush=True)
+            print(f"{pfx}Avg Step: {np.mean(chunk_latencies):.3f}s", flush=True)
+            print(f"{pfx}Avg Exec: {np.mean(chunk_exec_latencies):.3f}s", flush=True)
+            print(f"{pfx}Avg IPC:  {np.mean(chunk_ipc_latencies):.3f}s", flush=True)
+            if args.output_dir and (not args.no_video) and (not args.no_rgb):
+                print(f"{pfx}Saved videos to {args.output_dir}", flush=True)
 
     except Exception:
         print("\n" + "="*60, file=sys.stderr)
