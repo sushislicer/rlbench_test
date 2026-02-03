@@ -19,6 +19,11 @@ import random
 import atexit
 import traceback
 
+# Reduce CPU oversubscription when launching many env processes.
+# This is especially important when using planning / linear algebra backends.
+for _k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+
 # =============================================================================
 # Utils
 # =============================================================================
@@ -134,6 +139,20 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         from rlbench.utils import name_to_task_class
         from rlbench.backend.exceptions import InvalidActionError
 
+        def _construct_action_mode(cls, **kwargs):
+            """Construct an RLBench action-mode class with best-effort kwargs filtering.
+
+            RLBench/pyrep versions differ slightly in constructor signatures.
+            """
+            try:
+                import inspect
+
+                sig = inspect.signature(cls)
+                filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+                return cls(**filtered)
+            except Exception:
+                return cls()
+
         def _camel_to_snake(name):
             import re
             name = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
@@ -149,8 +168,11 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         fps = env_config.get("fps", 20.0)
         output_dir = env_config.get("output_dir", None)
         video_all = env_config.get("video_all", False)
+        no_video = env_config.get("no_video", False)
+        enable_rgb = bool(env_config.get("enable_rgb", True))
         
-        if output_dir and (rank == 0 or video_all):
+        # Video recording requires RGB observations.
+        if output_dir and not no_video and enable_rgb and (rank == 0 or video_all):
             os.makedirs(output_dir, exist_ok=True)
             f_front = os.path.join(output_dir, f"env{rank}_front.mp4")
             f_wrist = os.path.join(output_dir, f"env{rank}_wrist.mp4")
@@ -161,17 +183,26 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
 
         obs_config = ObservationConfig()
         obs_config.set_all(False)
-        # 开启需要的相机
-        obs_config.front_camera = CameraConfig(rgb=True, image_size=img_size)
-        obs_config.wrist_camera = CameraConfig(rgb=True, image_size=img_size)
+
+        # Cameras are expensive. Keep them optional.
+        if enable_rgb:
+            obs_config.front_camera = CameraConfig(rgb=True, image_size=img_size)
+            obs_config.wrist_camera = CameraConfig(rgb=True, image_size=img_size)
+        else:
+            obs_config.front_camera = CameraConfig(rgb=False, image_size=img_size)
+            obs_config.wrist_camera = CameraConfig(rgb=False, image_size=img_size)
+
         obs_config.gripper_pose = True
         obs_config.gripper_open = True
 
-        arm_mode_str = env_config.get("arm_mode", "planning")
+        arm_mode_str = env_config.get("arm_mode", "ik")
+        collision_checking = bool(env_config.get("collision_checking", False))
         if arm_mode_str == "planning":
-            arm_mode = EndEffectorPoseViaPlanning()
+            # Planning is significantly slower; prefer IK unless you truly need planning.
+            arm_mode = _construct_action_mode(EndEffectorPoseViaPlanning, collision_checking=collision_checking)
         else:
-            arm_mode = EndEffectorPoseViaIK()
+            # IK is much faster and typically required for high-throughput rollouts.
+            arm_mode = _construct_action_mode(EndEffectorPoseViaIK, collision_checking=collision_checking)
 
         action_mode = MoveArmThenGripper(arm_mode, Discrete())
         
@@ -183,6 +214,21 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         )
         print(f"[Worker {rank}] Launching RLBench...", flush=True)
         env.launch()
+
+        # Disable real-time throttling so simulation runs as fast as possible.
+        # In some setups CoppeliaSim defaults to real-time, which can cap throughput severely.
+        try:
+            from pyrep.backend import sim
+
+            realtime = bool(env_config.get("realtime", False))
+            if hasattr(sim, "simSetBoolParameter") and hasattr(sim, "sim_boolparam_realtime_simulation"):
+                sim.simSetBoolParameter(sim.sim_boolparam_realtime_simulation, bool(realtime))
+
+            idle_fps = int(env_config.get("idle_fps", 0))
+            if hasattr(sim, "simSetInt32Parameter") and hasattr(sim, "sim_intparam_idle_fps"):
+                sim.simSetInt32Parameter(sim.sim_intparam_idle_fps, int(idle_fps))
+        except Exception:
+            pass
         
         task_name = env_config["task_name"]
         if not task_name.islower():
@@ -213,8 +259,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 _, obs = task_env.reset()
                 done_flag = False
                 _write_obs(arrays, obs)
-                if vw_front: _write_video(vw_front, obs.front_rgb)
-                if vw_wrist: _write_video(vw_wrist, obs.wrist_rgb)
+                if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
+                if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
                 pipe.send("done")
                 
             elif cmd == "step":
@@ -226,8 +272,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                     try:
                         obs, reward, term = task_env.step(data)
                         _write_obs(arrays, obs)
-                        if vw_front: _write_video(vw_front, obs.front_rgb)
-                        if vw_wrist: _write_video(vw_wrist, obs.wrist_rgb)
+                        if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
+                        if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
                         arrays["reward"][0] = reward
                         arrays["done"][0] = term
                         done_flag = bool(term)
@@ -256,13 +302,24 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 obs = None
                 for j in range(len(actions)):
                     try:
+                        # Optional optimization: if RGB is disabled, avoid toggling per-step.
+                        # Note: dynamic toggling is version-dependent; keep it best-effort.
+                        if enable_rgb:
+                            # Disable rendering for intermediate steps if not recording video.
+                            should_render = (vw_front is not None) or (j == len(actions) - 1)
+                            try:
+                                obs_config.front_camera.rgb = should_render
+                                obs_config.wrist_camera.rgb = should_render
+                            except Exception:
+                                pass
+
                         obs, reward, term = task_env.step(actions[j])
                         last_reward = float(reward)
                         reward_sum += float(reward)
                         n_steps += 1
-                        # _write_obs moved to end
-                        if vw_front: _write_video(vw_front, obs.front_rgb)
-                        if vw_wrist: _write_video(vw_wrist, obs.wrist_rgb)
+                        
+                        if vw_front and hasattr(obs, "front_rgb"): _write_video(vw_front, obs.front_rgb)
+                        if vw_wrist and hasattr(obs, "wrist_rgb"): _write_video(vw_wrist, obs.wrist_rgb)
                         if bool(term):
                             done_flag = True
                             break
@@ -331,7 +388,22 @@ def _write_obs(arrays, obs):
 # =============================================================================
 
 class RLBenchVectorEnv:
-    def __init__(self, num_envs, task_name, image_size=(256, 256), robot_setup="panda", arm_mode="planning", fps=20.0, output_dir=None, video_all=False):
+    def __init__(
+        self,
+        num_envs,
+        task_name,
+        image_size=(256, 256),
+        robot_setup="panda",
+        arm_mode="ik",
+        fps=20.0,
+        output_dir=None,
+        video_all=False,
+        no_video=False,
+        enable_rgb=True,
+        collision_checking=False,
+        realtime=False,
+        idle_fps=0,
+    ):
         self.num_envs = num_envs
         self.shm_specs = {
             "front_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
@@ -370,7 +442,12 @@ class RLBenchVectorEnv:
             "arm_mode": arm_mode,
             "fps": fps,
             "output_dir": output_dir,
-            "video_all": video_all
+            "video_all": video_all,
+            "no_video": no_video,
+            "enable_rgb": enable_rgb,
+            "collision_checking": collision_checking,
+            "realtime": realtime,
+            "idle_fps": idle_fps,
         }
         
         print(f"Starting {num_envs} workers...", flush=True)
@@ -464,21 +541,75 @@ def main():
     parser = argparse.ArgumentParser()
     # Support both old and new args
     parser.add_argument("--num_envs", type=int, default=2)
+    parser.add_argument(
+        "--num_envs_total",
+        type=int,
+        default=None,
+        help="Total envs across all ranks when using torchrun (overrides --num_envs per rank)",
+    )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--task", type=str, default="OpenDrawer", dest="task_class")
     parser.add_argument("--task_class", type=str, default="OpenDrawer")
     parser.add_argument("--robot_setup", type=str, default="panda")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256])
-    parser.add_argument("--arm_mode", type=str, default="planning")
+    # Default to IK for throughput. Planning is dramatically slower.
+    parser.add_argument("--arm_mode", type=str, default="ik", choices=["ik", "planning"])
     parser.add_argument("--action_chunk", type=int, default=1)
     parser.add_argument("--fps", type=float, default=20.0)
-    parser.add_argument("--output_dir", type=str, default="rlbench_vec_env_videos")
+    # NOTE: default None to avoid accidental video/IO overhead during benchmarking.
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--pos_noise_std", type=float, default=0.01)
     parser.add_argument("--gripper_close_prob", type=float, default=0.05)
     parser.add_argument("--video_all", action="store_true", help="Record video for all environments (default: only env 0)")
+    parser.add_argument("--no_video", action="store_true", help="Disable video recording completely")
+    parser.add_argument("--no_rgb", action="store_true", help="Disable RGB observations (major speedup)")
+    parser.add_argument("--collision_checking", action="store_true", help="Enable collision checking in action mode (slower)")
+    parser.add_argument("--realtime", action="store_true", help="Run CoppeliaSim in real-time (slower). Default: as-fast-as-possible")
+    parser.add_argument("--idle_fps", type=int, default=0, help="CoppeliaSim idle FPS (0 is fastest)")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Throughput preset: --arm_mode ik --no_rgb --no_video --idle_fps 0 (overrides some flags)",
+    )
+    parser.add_argument(
+        "--ddp_bind_gpu",
+        action="store_true",
+        help="If launched with torchrun, set CUDA_VISIBLE_DEVICES=LOCAL_RANK for each rank (helps GPU isolation)",
+    )
     
     args, _ = parser.parse_known_args()
+
+    # Throughput preset (aimed at fast rollouts, not visuals).
+    if getattr(args, "fast", False):
+        args.arm_mode = "ik"
+        args.no_rgb = True
+        args.no_video = True
+        args.collision_checking = False
+        args.realtime = False
+        args.idle_fps = 0
+
+    # Torchrun / DDP info (used for multi-GPU launches).
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = _get_local_rank()
+    if world_size > 1:
+        print(f"[DDP] world_size={world_size} rank={rank} local_rank={local_rank}", flush=True)
+
+    # Optionally bind each rank to a single GPU.
+    # CoppeliaSim rendering (OpenGL) is not always affected by CUDA_VISIBLE_DEVICES,
+    # but isolating ranks is still a good practice for GPU-backed pipelines.
+    if world_size > 1 and getattr(args, "ddp_bind_gpu", False):
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(local_rank))
+
+    # If user specified total envs (e.g. 64) and launched with torchrun,
+    # split them across ranks so total env count stays constant.
+    if args.num_envs_total is not None and world_size > 1:
+        total = int(args.num_envs_total)
+        base = total // world_size
+        extra = total % world_size
+        args.num_envs = base + (1 if rank < extra else 0)
+        print(f"[DDP] num_envs_total={total} -> num_envs_this_rank={args.num_envs}", flush=True)
     
     # Handle aliases
     if args.max_steps != 100 and args.steps == 100:
@@ -524,7 +655,12 @@ def main():
             arm_mode=args.arm_mode,
             fps=args.fps,
             output_dir=args.output_dir,
-            video_all=args.video_all
+            video_all=args.video_all,
+            no_video=args.no_video,
+            enable_rgb=(not args.no_rgb),
+            collision_checking=args.collision_checking,
+            realtime=args.realtime,
+            idle_fps=args.idle_fps,
         )
 
         print("Resetting...", flush=True)
