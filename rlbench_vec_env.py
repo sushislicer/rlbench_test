@@ -161,8 +161,8 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         obs_config = ObservationConfig()
         obs_config.set_all(False)
         # 开启需要的相机
-        obs_config.front_camera = CameraConfig(rgb=True, depth=False, point_cloud=False, mask=False, image_size=img_size)
-        obs_config.wrist_camera = CameraConfig(rgb=True, depth=False, point_cloud=False, mask=False, image_size=img_size)
+        obs_config.front_camera = CameraConfig(rgb=True, image_size=img_size)
+        obs_config.wrist_camera = CameraConfig(rgb=True, image_size=img_size)
         obs_config.gripper_pose = True
         obs_config.gripper_open = True
 
@@ -182,14 +182,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         )
         print(f"[Worker {rank}] Launching RLBench...", flush=True)
         env.launch()
-        
-        if rank == 0:
-            try:
-                print(f"[Worker 0] Checking OpenGL renderer...", flush=True)
-                out = subprocess.check_output("glxinfo | grep 'OpenGL renderer'", shell=True).decode().strip()
-                print(f"[Worker 0] OpenGL Renderer: {out}", flush=True)
-            except Exception:
-                print(f"[Worker 0] Could not get OpenGL info (glxinfo missing?)", flush=True)
         
         task_name = env_config["task_name"]
         if not task_name.islower():
@@ -259,44 +251,22 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 reward_sum = 0.0
                 n_steps = 0
                 last_reward = 0.0
-                n_invalid = 0
-                
-                t_sim_sum = 0.0
-                t_shm_sum = 0.0
-                t_vid_sum = 0.0
                 
                 for j in range(len(actions)):
-                    t_a = time.perf_counter()
                     try:
                         obs, reward, term = task_env.step(actions[j])
-                        t_b = time.perf_counter()
-                        
                         last_reward = float(reward)
                         reward_sum += float(reward)
                         n_steps += 1
-                        
-                        # Cache images
-                        fr = obs.front_rgb
-                        wr = obs.wrist_rgb
-                        
                         _write_obs(arrays, obs)
-                        t_c = time.perf_counter()
-                        
-                        if vw_front: _write_video(vw_front, fr)
-                        if vw_wrist: _write_video(vw_wrist, wr)
-                        t_d = time.perf_counter()
-                        
-                        t_sim_sum += (t_b - t_a)
-                        t_shm_sum += (t_c - t_b)
-                        t_vid_sum += (t_d - t_c)
-                        
+                        if vw_front: _write_video(vw_front, obs.front_rgb)
+                        if vw_wrist: _write_video(vw_wrist, obs.wrist_rgb)
                         if bool(term):
                             done_flag = True
                             break
                     except InvalidActionError:
                         last_reward = 0.0
                         n_steps += 1
-                        n_invalid += 1
                         pass
                 
                 arrays["reward_sum"][0] = float(reward_sum)
@@ -304,13 +274,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 arrays["reward"][0] = float(last_reward)
                 arrays["done"][0] = bool(done_flag)
                 t_exec = time.perf_counter() - t0
-                pipe.send(("done", {
-                    "t_exec": t_exec, 
-                    "n_invalid": n_invalid,
-                    "t_sim": t_sim_sum,
-                    "t_shm": t_shm_sum,
-                    "t_vid": t_vid_sum
-                }))
+                pipe.send(("done", {"t_exec": t_exec}))
                 
             elif cmd == "close":
                 break
@@ -494,9 +458,9 @@ def main():
     parser = argparse.ArgumentParser()
     # Support both old and new args
     parser.add_argument("--num_envs", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--steps", type=int, default=100, dest="max_steps")
     parser.add_argument("--max_steps", type=int, default=100)
-    parser.add_argument("--task", type=str, default="OpenDrawer")
+    parser.add_argument("--task", type=str, default="OpenDrawer", dest="task_class")
     parser.add_argument("--task_class", type=str, default="OpenDrawer")
     parser.add_argument("--robot_setup", type=str, default="panda")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256])
@@ -510,11 +474,10 @@ def main():
     args, _ = parser.parse_known_args()
     
     # Handle aliases
-    if args.steps != 100 and args.max_steps == 100:
+    if args.max_steps != 100 and args.steps == 100:
+        pass # max_steps set
+    elif args.steps != 100:
         args.max_steps = args.steps
-    
-    if args.task != "OpenDrawer" and args.task_class == "OpenDrawer":
-        args.task_class = args.task
         
     print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
@@ -577,13 +540,6 @@ def main():
             
             # Stats
             exec_times = [st.get("t_exec", 0.0) for st in stats]
-            invalid_counts = [st.get("n_invalid", 0) for st in stats]
-            total_invalid = sum(invalid_counts)
-            
-            avg_sim = np.mean([st.get("t_sim", 0.0) for st in stats])
-            avg_shm = np.mean([st.get("t_shm", 0.0) for st in stats])
-            avg_vid = np.mean([st.get("t_vid", 0.0) for st in stats])
-            
             max_exec = max(exec_times) if exec_times else 0.0
             ipc_time = t_step - max_exec
             
@@ -591,8 +547,7 @@ def main():
             chunk_exec_latencies.append(max_exec)
             chunk_ipc_latencies.append(ipc_time)
 
-            print(f"Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s invalid={total_invalid}", flush=True)
-            print(f"  Breakdown (avg): Sim={avg_sim:.3f}s Shm={avg_shm:.3f}s Vid={avg_vid:.3f}s", flush=True)
+            print(f"Chunk {s}/{args.max_steps}: total={t_step:.3f}s exec={max_exec:.3f}s ipc={ipc_time:.3f}s", flush=True)
             
             s += k
 
