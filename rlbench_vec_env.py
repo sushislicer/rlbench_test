@@ -40,6 +40,10 @@ def _get_local_rank() -> int:
 def _get_global_rank() -> int:
     return _get_int_env(["RANK", "SLURM_PROCID"], 0)
 
+def _require_env(var: str) -> None:
+    if var not in os.environ or str(os.environ[var]).strip() == "":
+        raise RuntimeError(f"Missing environment variable {var}. Please set it.")
+
 def _start_xvfb(display_str: str, max_tries: int = 20):
     """Start Xvfb on a specific display or find a free one."""
     if not display_str:
@@ -516,7 +520,16 @@ def main():
     if args.task != "OpenDrawer" and args.task_class == "OpenDrawer":
         args.task_class = args.task
         
-    print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
+    _require_env("COPPELIASIM_ROOT")
+    
+    # Ensure LD_LIBRARY_PATH contains COPPELIASIM_ROOT for workers (spawned processes inherit env)
+    c_root = os.environ["COPPELIASIM_ROOT"]
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if c_root not in ld_path:
+        print(f"Auto-configuring LD_LIBRARY_PATH to include {c_root}", flush=True)
+        os.environ["LD_LIBRARY_PATH"] = f"{c_root}:{ld_path}"
+        
+    print(f"COPPELIASIM_ROOT: {c_root}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
     try:
