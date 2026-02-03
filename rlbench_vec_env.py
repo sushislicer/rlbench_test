@@ -148,8 +148,9 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         img_size = env_config["image_size"]
         fps = env_config.get("fps", 20.0)
         output_dir = env_config.get("output_dir", None)
+        video_all = env_config.get("video_all", False)
         
-        if output_dir:
+        if output_dir and (rank == 0 or video_all):
             os.makedirs(output_dir, exist_ok=True)
             f_front = os.path.join(output_dir, f"env{rank}_front.mp4")
             f_wrist = os.path.join(output_dir, f"env{rank}_wrist.mp4")
@@ -252,13 +253,14 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 n_steps = 0
                 last_reward = 0.0
                 
+                obs = None
                 for j in range(len(actions)):
                     try:
                         obs, reward, term = task_env.step(actions[j])
                         last_reward = float(reward)
                         reward_sum += float(reward)
                         n_steps += 1
-                        _write_obs(arrays, obs)
+                        # _write_obs moved to end
                         if vw_front: _write_video(vw_front, obs.front_rgb)
                         if vw_wrist: _write_video(vw_wrist, obs.wrist_rgb)
                         if bool(term):
@@ -268,6 +270,9 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                         last_reward = 0.0
                         n_steps += 1
                         pass
+                
+                if obs is not None:
+                    _write_obs(arrays, obs)
                 
                 arrays["reward_sum"][0] = float(reward_sum)
                 arrays["n_steps"][0] = int(n_steps)
@@ -326,7 +331,7 @@ def _write_obs(arrays, obs):
 # =============================================================================
 
 class RLBenchVectorEnv:
-    def __init__(self, num_envs, task_name, image_size=(256, 256), robot_setup="panda", arm_mode="planning", fps=20.0, output_dir=None):
+    def __init__(self, num_envs, task_name, image_size=(256, 256), robot_setup="panda", arm_mode="planning", fps=20.0, output_dir=None, video_all=False):
         self.num_envs = num_envs
         self.shm_specs = {
             "front_rgb":    ((num_envs, image_size[0], image_size[1], 3), np.uint8),
@@ -364,7 +369,8 @@ class RLBenchVectorEnv:
             "robot_setup": robot_setup,
             "arm_mode": arm_mode,
             "fps": fps,
-            "output_dir": output_dir
+            "output_dir": output_dir,
+            "video_all": video_all
         }
         
         print(f"Starting {num_envs} workers...", flush=True)
@@ -470,6 +476,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="rlbench_vec_env_videos")
     parser.add_argument("--pos_noise_std", type=float, default=0.01)
     parser.add_argument("--gripper_close_prob", type=float, default=0.05)
+    parser.add_argument("--video_all", action="store_true", help="Record video for all environments (default: only env 0)")
     
     args, _ = parser.parse_known_args()
     
@@ -516,7 +523,8 @@ def main():
             robot_setup=args.robot_setup,
             arm_mode=args.arm_mode,
             fps=args.fps,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            video_all=args.video_all
         )
 
         print("Resetting...", flush=True)
