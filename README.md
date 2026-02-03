@@ -233,3 +233,20 @@ python rl_vec_env.py \
 - GLVND/EGL libs available (`libEGL.so`, vendor libs)
 
 If EGL is not available, the run may fall back to software rendering or crash during context creation.
+
+### Headless Rendering with EGL (No X11)
+
+To run without Xvfb/X11 and use GPU rendering directly:
+
+```bash
+torchrun --nproc_per_node=4 rl_vec_env.py \
+  --render_backend egl \
+  --num_envs_total 64 \
+  --task_class OpenDrawer \
+  --ddp_bind_gpu
+```
+
+This sets `QT_QPA_PLATFORM=offscreen` and binds each rank to a GPU via `CUDA_VISIBLE_DEVICES`.
+Ensure `COPPELIASIM_ROOT` is set correctly so the script can find the Qt plugins.
+
+If EGL is not available, the run may fall back to software rendering or crash during context creation.

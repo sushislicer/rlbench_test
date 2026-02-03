@@ -18,7 +18,7 @@ import subprocess
 import random
 import atexit
 import traceback
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 def _sample_gpu_utilization(*, gpu_index: Optional[int] = None) -> Optional[Dict[str, float]]:
@@ -96,6 +96,183 @@ def _sample_gpu_utilization(*, gpu_index: Optional[int] = None) -> Optional[Dict
         }
     except Exception:
         return None
+
+
+def _parse_csv_ints(s: Optional[str]) -> List[int]:
+    if s is None:
+        return []
+    txt = str(s).strip()
+    if txt == "":
+        return []
+    if txt.lower() in {"none", "null"}:
+        return []
+    out: List[int] = []
+    for part in txt.split(","):
+        p = part.strip()
+        if p == "":
+            continue
+        out.append(int(p))
+    return out
+
+
+def _parse_csv_strs(s: Optional[str]) -> List[str]:
+    if s is None:
+        return []
+    txt = str(s).strip()
+    if txt == "":
+        return []
+    if txt.lower() in {"none", "null"}:
+        return []
+    out: List[str] = []
+    for part in txt.split(","):
+        p = part.strip()
+        if p == "":
+            continue
+        out.append(p)
+    return out
+
+
+def _detect_gpu_indices_via_nvidia_smi() -> List[int]:
+    """Return physical GPU indices visible to this process (best-effort)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        ids: List[int] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line == "":
+                continue
+            try:
+                ids.append(int(line))
+            except Exception:
+                continue
+        return ids
+    except Exception:
+        return []
+
+
+def _query_nvidia_gpu_bus_ids() -> Dict[int, str]:
+    """Map physical GPU index -> PCI bus id string (best-effort).
+
+    Example bus id: "00000000:65:00.0"
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader,nounits"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        m: Dict[int, str] = {}
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                idx = int(parts[0])
+            except Exception:
+                continue
+            bus_id = str(parts[1]).strip()
+            if bus_id:
+                m[idx] = bus_id
+        return m
+    except Exception:
+        return {}
+
+
+def _pci_bus_id_to_xorg_busid(bus_id: str) -> Optional[str]:
+    """Convert NVIDIA bus id (domain:bus:device.func in hex) to Xorg BusID string.
+
+    NVIDIA: 00000000:65:00.0
+    Xorg:   PCI:101:0:0
+
+    Returns None if parsing fails.
+    """
+    try:
+        s = str(bus_id).strip()
+        if s == "":
+            return None
+        # domain:bus:device.func
+        dom_bus, dev_fn = s.split(".")
+        dom, bus, dev = dom_bus.split(":")
+        fn = dev_fn
+        dom_i = int(dom, 16)
+        bus_i = int(bus, 16)
+        dev_i = int(dev, 16)
+        fn_i = int(fn, 10)
+        # Domain is often 0 and can be omitted in many configs, but keep it explicit.
+        # Xorg expects decimal.
+        if dom_i == 0:
+            return f"PCI:{bus_i}:{dev_i}:{fn_i}"
+        return f"PCI:{dom_i}:{bus_i}:{dev_i}:{fn_i}"
+    except Exception:
+        return None
+
+
+def _start_xorg_nvidia(*, display: str, gpu_index: int, log_dir: str = "/tmp") -> subprocess.Popen:
+    """(Deprecated) Start a minimal NVIDIA-backed Xorg server."""
+    raise NotImplementedError("Xorg backend is not supported in this environment.")
+
+
+def _pick_worker_gpu_id(*, worker_id: int, env_config: dict) -> Optional[int]:
+    """Pick a physical GPU id for this worker based on the configured policy.
+
+    NOTE: This only *binds CUDA-visible devices*. Whether OpenGL/EGL rendering
+    follows depends on the rendering backend and driver stack.
+    """
+
+    policy = str(env_config.get("worker_gpu_policy", "inherit")).lower().strip()
+    if policy in {"", "inherit", "none"}:
+        return None
+
+    gpu_ids = env_config.get("worker_gpu_ids")
+    if not isinstance(gpu_ids, (list, tuple)) or len(gpu_ids) == 0:
+        gpu_ids = _detect_gpu_indices_via_nvidia_smi() or [0]
+    gpu_ids = [int(x) for x in gpu_ids]
+
+    local_rank = _get_local_rank()
+    global_rank = int(env_config.get("global_rank", 0))
+    num_envs = int(env_config.get("num_envs", 1))
+
+    if policy == "per_rank":
+        return int(gpu_ids[int(local_rank) % len(gpu_ids)])
+    if policy == "local_round_robin":
+        # Round-robin within this torchrun local rank.
+        return int(gpu_ids[(int(local_rank) * int(num_envs) + int(worker_id)) % len(gpu_ids)])
+    if policy == "global_round_robin":
+        # Round-robin across all ranks (uses global rank).
+        return int(gpu_ids[(int(global_rank) * int(num_envs) + int(worker_id)) % len(gpu_ids)])
+
+    # Backward/typo tolerance
+    if policy in {"rr", "round_robin"}:
+        return int(gpu_ids[(int(worker_id)) % len(gpu_ids)])
+
+    raise ValueError(f"Unknown worker_gpu_policy: {policy}")
+
+
+def _maybe_force_nvidia_gl_env(*, enable: bool) -> None:
+    if not enable:
+        return
+    # If the environment already forced software rendering, undo it.
+    os.environ.pop("LIBGL_ALWAYS_SOFTWARE", None)
+    os.environ.pop("LIBGL_ALWAYS_INDIRECT", None)
+    # Force GLVND to pick NVIDIA.
+    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+    # In NVIDIA containers, this needs to include graphics to expose GL/EGL.
+    os.environ.setdefault("NVIDIA_DRIVER_CAPABILITIES", "graphics,compute,utility")
+    # If present, point GLVND EGL loader to the NVIDIA vendor JSON.
+    # Common locations:
+    # - /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+    # - /usr/share/glvnd/egl_vendor.d/15_nvidia.json
+    for p in (
+        "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+        "/usr/share/glvnd/egl_vendor.d/15_nvidia.json",
+    ):
+        if os.path.exists(p):
+            os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", p)
+            break
 
 # Reduce CPU oversubscription when launching many env processes.
 # This is especially important when using planning / linear algebra backends.
@@ -189,6 +366,22 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
     vw_front = None
     vw_wrist = None
     try:
+        # 0) (Optional) bind this worker process to a specific GPU.
+        # IMPORTANT: this is best-effort. It primarily affects CUDA-visible devices.
+        # Whether CoppeliaSim/OpenGL rendering follows depends on the rendering backend.
+        gpu_id = _pick_worker_gpu_id(worker_id=int(rank), env_config=env_config)
+        if gpu_id is not None:
+            # For many NVIDIA container setups, NVIDIA_VISIBLE_DEVICES is the effective switch.
+            # Setting it here may or may not affect already-exposed /dev/nvidia* nodes, but
+            # it can influence some loaders.
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(int(gpu_id))
+            os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+            os.environ.setdefault("NVIDIA_VISIBLE_DEVICES", str(int(gpu_id)))
+            # Some EGL stacks respect this.
+            os.environ.setdefault("EGL_DEVICE_ID", str(int(gpu_id)))
+
+        _maybe_force_nvidia_gl_env(enable=bool(env_config.get("force_nvidia_gl", False)))
+
         # 1. Setup Display / Rendering backend
         # Stagger start to reduce system load spikes
         time.sleep(random.uniform(0.2, 2.0))
@@ -223,19 +416,28 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             # QT_QPA_PLATFORM=offscreen, Qt will load the wrong plugin and you may get:
             #   "This plugin does not support createPlatformOpenGLContext!"
             # Force a sane EGL-capable default.
-            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "minimalegl"
-            qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "egl"
+            # "offscreen" is the standard Qt headless platform. "minimalegl" is another option.
+            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "offscreen"
+            qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "desktop" # or "egl"
             qt_xcb = _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none"
             pyopengl = _norm_opt_str(env_config.get("pyopengl_platform")) or "egl"
 
             os.environ["QT_QPA_PLATFORM"] = qpa
-            os.environ["QT_OPENGL"] = qt_opengl
+            # QT_OPENGL=desktop usually forces hardware acceleration if available.
+            if qt_opengl:
+                os.environ["QT_OPENGL"] = qt_opengl
             # Avoid XCB integration when running without X
             os.environ["QT_XCB_GL_INTEGRATION"] = qt_xcb
             # Some OpenGL stacks respect this for EGL selection
             os.environ["PYOPENGL_PLATFORM"] = pyopengl
             # Ensure we don't accidentally bind to an X display
             os.environ.pop("DISPLAY", None)
+            
+            # Ensure plugin path is set if we know COPPELIASIM_ROOT
+            if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
+                c_root = os.environ.get("COPPELIASIM_ROOT")
+                if c_root and os.path.isdir(c_root):
+                    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = c_root
 
         local_rank = _get_local_rank()
 
@@ -288,6 +490,11 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 print(f"[Worker {rank}] Starting Xvfb on {os.environ.get('DISPLAY')}...", flush=True)
             else:
                 print(f"[Worker {rank}] render_backend={render_backend} DISPLAY={os.environ.get('DISPLAY', '')}", flush=True)
+            if gpu_id is not None:
+                print(
+                    f"[Worker {rank}] GPU bind: gpu_id={int(gpu_id)} CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}",
+                    flush=True,
+                )
 
         # 2. Import RLBench (must be after DISPLAY set)
         from rlbench.environment import Environment
@@ -736,6 +943,9 @@ class RLBenchVectorEnv:
         video_rank0_only=False,
         profile_timing: bool = False,
         rgb_video_only: bool = False,
+        worker_gpu_policy: str = "inherit",
+        worker_gpu_ids: Optional[List[int]] = None,
+        force_nvidia_gl: bool = False,
     ):
         self.num_envs = num_envs
         self.verbose = bool(verbose)
@@ -755,6 +965,7 @@ class RLBenchVectorEnv:
         self.arrays = {}
         self.procs = []
         self.pipes = []
+        self.xorg_proc = None
         
         # Register cleanup
         atexit.register(self.close)
@@ -769,6 +980,11 @@ class RLBenchVectorEnv:
 
         # Start Workers
         ctx = mp.get_context("spawn")
+        
+        # If using EGL, default to per-rank GPU binding if not specified.
+        if render_backend == "egl" and worker_gpu_policy == "inherit":
+            worker_gpu_policy = "per_rank"
+
         env_config = {
             "task_name": task_name,
             "image_size": image_size,
@@ -800,6 +1016,10 @@ class RLBenchVectorEnv:
             "video_rank0_only": bool(video_rank0_only),
             "profile_timing": bool(profile_timing),
             "rgb_video_only": bool(rgb_video_only),
+            "num_envs": int(num_envs),
+            "worker_gpu_policy": str(worker_gpu_policy),
+            "worker_gpu_ids": list(worker_gpu_ids) if worker_gpu_ids is not None else None,
+            "force_nvidia_gl": bool(force_nvidia_gl),
         }
         
         if self.verbose:
@@ -875,6 +1095,14 @@ class RLBenchVectorEnv:
         for p in self.procs:
             p.join(timeout=5)
             if p.is_alive(): p.terminate()
+            
+        if self.xorg_proc:
+            try:
+                self.xorg_proc.terminate()
+                self.xorg_proc.wait(timeout=2.0)
+            except:
+                try: self.xorg_proc.kill()
+                except: pass
             
         for shm in self.shm_objs:
             try: shm.close(); shm.unlink()
@@ -960,12 +1188,42 @@ def main():
         action="store_true",
         help="If launched with torchrun, set CUDA_VISIBLE_DEVICES=LOCAL_RANK for each rank (helps GPU isolation)",
     )
+
+    parser.add_argument(
+        "--worker_gpu_policy",
+        type=str,
+        default="inherit",
+        choices=["inherit", "none", "per_rank", "local_round_robin", "global_round_robin"],
+        help=(
+            "Bind each RLBench worker process to a GPU by setting CUDA_VISIBLE_DEVICES inside the worker. "
+            "Policies: inherit/none (default), per_rank (one GPU per torchrun local rank), "
+            "local_round_robin (spread workers across GPUs within a rank), global_round_robin (spread across all ranks). "
+            "This is best-effort and mainly affects CUDA-visible devices; OpenGL rendering depends on the backend."
+        ),
+    )
+    parser.add_argument(
+        "--worker_gpu_ids",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated physical GPU indices to use for --worker_gpu_policy (e.g. '0,1,2,3'). "
+            "Default: auto-detect via nvidia-smi, else [0]."
+        ),
+    )
+    parser.add_argument(
+        "--force_nvidia_gl",
+        action="store_true",
+        help=(
+            "Best-effort GLVND hints to pick the NVIDIA OpenGL/EGL implementation (sets __GLX_VENDOR_LIBRARY_NAME=nvidia, "
+            "and may set __EGL_VENDOR_LIBRARY_FILENAMES). Useful when you suspect software rendering."
+        ),
+    )
     parser.add_argument(
         "--render_backend",
         type=str,
         default="xvfb",
         choices=["xvfb", "egl", "external"],
-        help="Rendering backend: xvfb (default), egl (no X), external (use existing DISPLAY)",
+        help="Rendering backend: xvfb (default), egl (headless GPU via QT_QPA_PLATFORM=offscreen), external (use existing DISPLAY)",
     )
     parser.add_argument(
         "--per_process_xvfb",
@@ -1041,6 +1299,9 @@ def main():
     parser.add_argument("--train_ckpt", type=str, default=None, help="Optional checkpoint path (rank0 only)")
     
     args, _ = parser.parse_known_args()
+
+    # Parse worker_gpu_ids early so we can pass a clean list down to workers.
+    worker_gpu_ids = _parse_csv_ints(getattr(args, "worker_gpu_ids", None))
 
     # Torchrun / DDP info (used for multi-GPU launches).
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1193,6 +1454,9 @@ def main():
             video_rank0_only=bool(getattr(args, "video_rank0_only", False)),
             profile_timing=bool(getattr(args, "profile_timing", False)),
             rgb_video_only=bool(getattr(args, "rgb_video_only", False)),
+            worker_gpu_policy=str(getattr(args, "worker_gpu_policy", "inherit")),
+            worker_gpu_ids=(worker_gpu_ids if len(worker_gpu_ids) > 0 else None),
+            force_nvidia_gl=bool(getattr(args, "force_nvidia_gl", False)),
         )
 
         def _run_env_loop(*, tag: str):
