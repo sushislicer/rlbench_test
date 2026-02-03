@@ -126,26 +126,41 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             per_process_xvfb = str(os.environ["RLBENCH_PER_PROCESS_XVFB"]).strip() == "1"
         per_process_xvfb = bool(env_config.get("per_process_xvfb", per_process_xvfb))
 
+        def _norm_opt_str(v):
+            if v is None:
+                return None
+            s = str(v).strip()
+            if s == "":
+                return None
+            if s.lower() in {"none", "null"}:
+                return None
+            return s
+
         # EGL mode: attempt GPU-backed headless rendering (no X server).
         # This only works if your container/host has NVIDIA drivers + EGL/GLVND correctly installed.
         if render_backend == "egl":
             per_process_xvfb = False
             # Qt offscreen + EGL hints (best-effort)
-            os.environ.setdefault("QT_QPA_PLATFORM", str(env_config.get("qt_qpa_platform", "offscreen")))
-            os.environ.setdefault("QT_OPENGL", str(env_config.get("qt_opengl", "egl")))
+            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "offscreen"
+            qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "egl"
+            os.environ.setdefault("QT_QPA_PLATFORM", qpa)
+            os.environ.setdefault("QT_OPENGL", qt_opengl)
             # Avoid XCB integration when running without X
-            os.environ.setdefault("QT_XCB_GL_INTEGRATION", str(env_config.get("qt_xcb_gl_integration", "none")))
+            os.environ.setdefault(
+                "QT_XCB_GL_INTEGRATION",
+                _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none",
+            )
             # Some OpenGL stacks respect this for EGL selection
-            os.environ.setdefault("PYOPENGL_PLATFORM", str(env_config.get("pyopengl_platform", "egl")))
+            os.environ.setdefault("PYOPENGL_PLATFORM", _norm_opt_str(env_config.get("pyopengl_platform")) or "egl")
             # Ensure we don't accidentally bind to an X display
             os.environ.pop("DISPLAY", None)
 
         local_rank = _get_local_rank()
 
         # Optional GL/Qt hints (best-effort; actual GPU-backed rendering depends on system setup)
-        qt_qpa = env_config.get("qt_qpa_platform")
+        qt_qpa = _norm_opt_str(env_config.get("qt_qpa_platform"))
         if qt_qpa:
-            os.environ.setdefault("QT_QPA_PLATFORM", str(qt_qpa))
+            os.environ.setdefault("QT_QPA_PLATFORM", qt_qpa)
         glx_vendor = env_config.get("glx_vendor")
         if glx_vendor:
             os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", str(glx_vendor))
