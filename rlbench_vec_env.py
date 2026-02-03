@@ -13,7 +13,6 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 import numpy as np
-import cv2
 import subprocess
 import random
 import atexit
@@ -137,6 +136,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
         from rlbench.backend.exceptions import InvalidActionError
+        import cv2
 
         def _camel_to_snake(name):
             import re
@@ -522,14 +522,7 @@ def main():
         
     _require_env("COPPELIASIM_ROOT")
     
-    # Ensure LD_LIBRARY_PATH contains COPPELIASIM_ROOT for workers (spawned processes inherit env)
-    c_root = os.environ["COPPELIASIM_ROOT"]
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if c_root not in ld_path:
-        print(f"Auto-configuring LD_LIBRARY_PATH to include {c_root}", flush=True)
-        os.environ["LD_LIBRARY_PATH"] = f"{c_root}:{ld_path}"
-        
-    print(f"COPPELIASIM_ROOT: {c_root}", flush=True)
+    print(f"COPPELIASIM_ROOT: {os.environ['COPPELIASIM_ROOT']}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
     try:
