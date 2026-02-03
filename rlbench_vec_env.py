@@ -13,11 +13,11 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 from multiprocessing.connection import Connection
 import numpy as np
+import cv2
 import subprocess
 import random
 import atexit
 import traceback
-import ctypes
 
 # =============================================================================
 # Utils
@@ -43,158 +43,6 @@ def _get_global_rank() -> int:
 def _require_env(var: str) -> None:
     if var not in os.environ or str(os.environ[var]).strip() == "":
         raise RuntimeError(f"Missing environment variable {var}. Please set it.")
-
-def _prepend_path_env(var: str, path: str) -> None:
-    """Prepend a colon-separated path entry to an env var if missing."""
-    p = str(path).strip()
-    if not p:
-        return
-    cur = os.environ.get(var, "")
-    parts = [x for x in cur.split(":") if x] if cur else []
-    if p in parts:
-        return
-    os.environ[var] = f"{p}:{cur}" if cur else p
-
-def _candidate_coppeliasim_lib_dirs(c_root: str) -> list[str]:
-    """Return candidate directories that may contain libcoppeliaSim.so.*."""
-    # NOTE: avoid expanduser() here because workers may override $HOME for isolation.
-    # COPPELIASIM_ROOT should be exported as an absolute path.
-    r = os.path.abspath(str(c_root))
-    cands = [
-        r,
-        os.path.join(r, "lib"),
-        os.path.join(r, "lib64"),
-        # Some CoppeliaSim layouts place libs under programming/...
-        os.path.join(r, "programming", "remoteApiBindings", "lib", "lib"),
-    ]
-
-    def _has_lib(d: str) -> bool:
-        try:
-            return any(
-                os.path.exists(os.path.join(d, nm))
-                for nm in ("libcoppeliaSim.so.1", "libcoppeliaSim.so", "libcoppeliaSim.so.1.0")
-            )
-        except Exception:
-            return False
-
-    lib_dirs = [d for d in cands if os.path.isdir(d)]
-    if any(_has_lib(d) for d in lib_dirs):
-        return lib_dirs
-
-    # Fallback: bounded directory walk if the expected locations don't contain the library.
-    # This keeps things robust against different extracted layouts.
-    found: set[str] = set()
-    try:
-        root_depth = r.rstrip(os.sep).count(os.sep)
-        max_depth = 6
-        for dirpath, dirnames, filenames in os.walk(r):
-            depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
-            if depth > max_depth:
-                dirnames[:] = []
-                continue
-            if (
-                "libcoppeliaSim.so.1" in filenames
-                or "libcoppeliaSim.so" in filenames
-                or "libcoppeliaSim.so.1.0" in filenames
-            ):
-                found.add(dirpath)
-    except Exception:
-        pass
-
-    # Keep deterministic order
-    for d in sorted(found):
-        if d not in lib_dirs:
-            lib_dirs.append(d)
-    return lib_dirs
-
-
-def _ensure_coppeliasim_soname_symlink(lib_dir: str) -> None:
-    """Best-effort: create libcoppeliaSim.so.1 symlink if only libcoppeliaSim.so exists.
-
-    Some installations may miss the SONAME symlink that PyRep expects.
-    """
-    so1 = os.path.join(lib_dir, "libcoppeliaSim.so.1")
-    so = os.path.join(lib_dir, "libcoppeliaSim.so")
-    so10 = os.path.join(lib_dir, "libcoppeliaSim.so.1.0")
-    if os.path.exists(so1):
-        return
-    target = None
-    if os.path.exists(so10):
-        target = os.path.basename(so10)
-    elif os.path.exists(so):
-        target = os.path.basename(so)
-    if target is None:
-        return
-    try:
-        os.symlink(target, so1)
-    except Exception:
-        # Ignore if we don't have permissions or filesystem doesn't support symlinks.
-        pass
-
-def _setup_coppeliasim_runtime(*, ensure_loaded: bool) -> None:
-    """Make CoppeliaSim libraries discoverable for PyRep/RLBench.
-
-    Why this exists:
-    - PyRep loads `libcoppeliaSim.so.1` via cffi/dlopen.
-    - Depending on how the process is launched (torchrun/conda), workers may not
-      reliably see the correct runtime library search path.
-    - We fix this by:
-        1) Prepending likely library directories to LD_LIBRARY_PATH.
-        2) Optionally pre-loading libcoppeliaSim with RTLD_GLOBAL before importing RLBench.
-    """
-    c_root_raw = str(os.environ.get("COPPELIASIM_ROOT", "")).strip()
-    if not c_root_raw:
-        return
-
-    # Be robust to COPPELIASIM_ROOT being provided with unexpanded tokens (common in
-    # docker-compose / env files), e.g. "$HOME/..." or "~/...".
-    c_root = os.path.expandvars(c_root_raw)
-    if "~" in c_root:
-        # NOTE: safe here because we call this before workers override $HOME.
-        c_root = os.path.expanduser(c_root)
-    c_root = os.path.abspath(c_root)
-
-    # Ensure Qt plugins can be found (harmless if already set)
-    if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ or str(os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"]).strip() == "":
-        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = c_root
-
-    lib_dirs = _candidate_coppeliasim_lib_dirs(c_root)
-    for d in lib_dirs:
-        _prepend_path_env("LD_LIBRARY_PATH", d)
-
-    if not ensure_loaded:
-        return
-
-    # Pre-load libcoppeliaSim so the subsequent cffi dlopen("libcoppeliaSim.so.1") succeeds.
-    # Try loading by SONAME first (works if LD_LIBRARY_PATH at process start was correct).
-    try:
-        ctypes.CDLL("libcoppeliaSim.so.1", mode=ctypes.RTLD_GLOBAL)
-        return
-    except OSError:
-        pass
-
-    # Then try absolute paths (robust even if search paths are misconfigured).
-    lib_names = ("libcoppeliaSim.so.1", "libcoppeliaSim.so.1.0", "libcoppeliaSim.so")
-    last_err: Exception | None = None
-    for d in lib_dirs:
-        _ensure_coppeliasim_soname_symlink(d)
-        for nm in lib_names:
-            p = os.path.join(d, nm)
-            if not os.path.exists(p):
-                continue
-            try:
-                ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
-                return
-            except OSError as e:
-                last_err = e
-
-    # If we can't even locate the library under COPPELIASIM_ROOT, fail with a clear message.
-    # (Otherwise PyRep will fail with a less actionable ImportError.)
-    raise ImportError(
-        "Could not locate/load libcoppeliaSim.so.1 under COPPELIASIM_ROOT. "
-        f"COPPELIASIM_ROOT={c_root!r} searched={lib_dirs!r}. "
-        f"Last error: {last_err!r}"
-    )
 
 def _start_xvfb(display_str: str, max_tries: int = 20):
     """Start Xvfb on a specific display or find a free one."""
@@ -261,7 +109,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
     env = None
     vw_front = None
     vw_wrist = None
-    
     try:
         # 1. Setup Display
         # Stagger start to reduce system load spikes (32 workers total)
@@ -273,11 +120,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         base_disp = 20000 + (local_rank * 1000) + (rank * 10)
         xvfb_proc, display = _start_xvfb(f":{base_disp}")
         os.environ["DISPLAY"] = display
-
-        # Ensure CoppeliaSim libs are discoverable *before* changing $HOME and before
-        # importing RLBench/PyRep.
-        _require_env("COPPELIASIM_ROOT")
-        _setup_coppeliasim_runtime(ensure_loaded=True)
         
         # Isolate CoppeliaSim home to avoid config corruption
         # /tmp/coppelia_home/rank_X/env_Y
@@ -295,7 +137,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         from rlbench.observation_config import ObservationConfig, CameraConfig
         from rlbench.utils import name_to_task_class
         from rlbench.backend.exceptions import InvalidActionError
-        import cv2
 
         def _camel_to_snake(name):
             import re
@@ -494,18 +335,6 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
                 "   Solution: Disable the 'ZMQ remote API' add-on in CoppeliaSim's installation folder (addOns.txt or remove the lua file).\n"
                 "3. Headless rendering (Xvfb) failed to initialize OpenGL properly.\n"
             )
-
-        if "libcoppeliaSim.so.1" in err_msg and "cannot open shared object file" in err_msg:
-            sys.stderr.write(
-                "\n[Worker Hint] Could not load libcoppeliaSim.so.1 (CoppeliaSim runtime library).\n"
-                "This usually means COPPELIASIM_ROOT/LD_LIBRARY_PATH is not pointing at the actual CoppeliaSim install.\n"
-                f"  COPPELIASIM_ROOT={os.environ.get('COPPELIASIM_ROOT', '')!r}\n"
-                f"  LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '')!r}\n"
-                "Notes:\n"
-                "  - COPPELIASIM_ROOT should be an *absolute* path to CoppeliaSim 4.1.0.\n"
-                "  - If COPPELIASIM_ROOT was set via an env file as '$HOME/...' or '~/...', it must be expanded\n"
-                "    (this script now expands it early, before overriding HOME).\n"
-            )
         
         sys.stderr.flush()
         try:
@@ -558,12 +387,6 @@ class RLBenchVectorEnv:
         
         # Register cleanup
         atexit.register(self.close)
-
-        _require_env("COPPELIASIM_ROOT")
-
-        # Ensure workers inherit a sane runtime environment for CoppeliaSim/PyRep.
-        # (Don't pre-load the library in the parent; only adjust env vars.)
-        _setup_coppeliasim_runtime(ensure_loaded=False)
         
         # Create Shared Memory
         for name, (shape, dtype) in self.shm_specs.items():
@@ -699,7 +522,14 @@ def main():
         
     _require_env("COPPELIASIM_ROOT")
     
-    print(f"COPPELIASIM_ROOT: {os.environ['COPPELIASIM_ROOT']}", flush=True)
+    # Ensure LD_LIBRARY_PATH contains COPPELIASIM_ROOT for workers (spawned processes inherit env)
+    c_root = os.environ["COPPELIASIM_ROOT"]
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if c_root not in ld_path:
+        print(f"Auto-configuring LD_LIBRARY_PATH to include {c_root}", flush=True)
+        os.environ["LD_LIBRARY_PATH"] = f"{c_root}:{ld_path}"
+        
+    print(f"COPPELIASIM_ROOT: {c_root}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
     try:
