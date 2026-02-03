@@ -18,6 +18,84 @@ import subprocess
 import random
 import atexit
 import traceback
+from typing import Dict, Optional
+
+
+def _sample_gpu_utilization(*, gpu_index: Optional[int] = None) -> Optional[Dict[str, float]]:
+    """Best-effort GPU utilization sampler.
+
+    Returns a dict like:
+      {"gpu": <percent>, "mem": <percent>, "mem_used_mib": <MiB>, "mem_total_mib": <MiB>}
+
+    Works in 2 modes:
+    - NVML via `pynvml` (preferred, low overhead)
+    - `nvidia-smi` subprocess (fallback)
+
+    If neither is available, returns None.
+    """
+
+    # Choose a default GPU index if not specified.
+    # NOTE: CUDA_VISIBLE_DEVICES does *not* remap NVML indexes, but in many
+    # torchrun setups this is set to the physical index anyway.
+    if gpu_index is None:
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if vis and vis.lower() not in {"all", "none"}:
+            try:
+                gpu_index = int(vis.split(",")[0].strip())
+            except Exception:
+                gpu_index = 0
+        else:
+            gpu_index = 0
+
+    # -----------------------------
+    # Try NVML first (low overhead)
+    # -----------------------------
+    try:
+        import pynvml  # type: ignore
+
+        if not hasattr(_sample_gpu_utilization, "_nvml_inited"):
+            pynvml.nvmlInit()
+            _sample_gpu_utilization._nvml_inited = True  # type: ignore[attr-defined]
+            atexit.register(lambda: pynvml.nvmlShutdown())
+
+        handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu_index))
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        mem_total = float(mem.total) / (1024.0 * 1024.0)
+        mem_used = float(mem.used) / (1024.0 * 1024.0)
+        mem_pct = float(mem_used / mem_total) if mem_total > 0 else 0.0
+        return {
+            "gpu": float(util.gpu),
+            "mem": float(mem_pct * 100.0),
+            "mem_used_mib": float(mem_used),
+            "mem_total_mib": float(mem_total),
+        }
+    except Exception:
+        pass
+
+    # ---------------------------------
+    # Fallback: parse nvidia-smi output
+    # ---------------------------------
+    try:
+        cmd = [
+            "nvidia-smi",
+            f"--id={int(gpu_index)}",
+            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+        # Expected: "GPU%, MEM%, usedMiB, totalMiB"
+        parts = [p.strip() for p in out.split(",")]
+        if len(parts) < 4:
+            return None
+        return {
+            "gpu": float(parts[0]),
+            "mem": float(parts[1]),
+            "mem_used_mib": float(parts[2]),
+            "mem_total_mib": float(parts[3]),
+        }
+    except Exception:
+        return None
 
 # Reduce CPU oversubscription when launching many env processes.
 # This is especially important when using planning / linear algebra backends.
@@ -937,6 +1015,24 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--profile_gpu",
+        action="store_true",
+        help=(
+            "Best-effort GPU utilization sampling (uses pynvml if installed, else nvidia-smi). "
+            "Prints per-chunk GPU util/mem util to help determine whether rendering is actually using the GPU."
+        ),
+    )
+    parser.add_argument(
+        "--gpu_index",
+        type=int,
+        default=None,
+        help=(
+            "GPU index to sample for --profile_gpu. Default: inferred from CUDA_VISIBLE_DEVICES (first entry), else 0. "
+            "Note: NVML indexes are physical GPU indexes."
+        ),
+    )
+
     # Minimal training loop settings (mode=train)
     parser.add_argument("--train_updates", type=int, default=10, help="Number of optimizer updates")
     parser.add_argument("--train_lr", type=float, default=3e-4, help="Learning rate")
@@ -1130,6 +1226,11 @@ def main():
             chunk_sim_step_latencies = []
             chunk_cpu_util_latencies = []
 
+            chunk_gpu_util = []
+            chunk_gpu_mem = []
+            chunk_gpu_mem_used = []
+            chunk_gpu_mem_total = []
+
             done = None
             while s < args.max_steps:
                 k = min(args.action_chunk, args.max_steps - s)
@@ -1171,6 +1272,18 @@ def main():
                 exec_times = [st.get("t_exec", 0.0) for st in stats]
                 max_exec = max(exec_times) if exec_times else 0.0
                 ipc_time = t_step - max_exec
+
+                gpu_sample = None
+                if bool(getattr(args, "profile_gpu", False)):
+                    gpu_sample = _sample_gpu_utilization(gpu_index=getattr(args, "gpu_index", None))
+                    if isinstance(gpu_sample, dict):
+                        try:
+                            chunk_gpu_util.append(float(gpu_sample.get("gpu", 0.0)))
+                            chunk_gpu_mem.append(float(gpu_sample.get("mem", 0.0)))
+                            chunk_gpu_mem_used.append(float(gpu_sample.get("mem_used_mib", 0.0)))
+                            chunk_gpu_mem_total.append(float(gpu_sample.get("mem_total_mib", 0.0)))
+                        except Exception:
+                            pass
 
                 if bool(getattr(args, "profile_timing", False)):
                     # Choose the env on the critical path (max worker exec time) and read its breakdown.
@@ -1229,6 +1342,16 @@ def main():
                 if verbose:
                     pfx = f"[rank {rank}] " if world_size > 1 else ""
                     if bool(getattr(args, "profile_timing", False)):
+                        gpu_txt = ""
+                        if isinstance(gpu_sample, dict):
+                            try:
+                                gpu_txt = (
+                                    f" gpu={float(gpu_sample.get('gpu', 0.0)):.0f}%"
+                                    f" mem={float(gpu_sample.get('mem', 0.0)):.0f}%"
+                                    f" ({float(gpu_sample.get('mem_used_mib', 0.0)):.0f}/{float(gpu_sample.get('mem_total_mib', 0.0)):.0f}MiB)"
+                                )
+                            except Exception:
+                                gpu_txt = ""
                         print(
                             f"{pfx}{tag} Chunk {s}/{args.max_steps}: total={t_step:.3f}s "
                             f"build={t_build:.3f}s env_call={t_envcall:.3f}s "
@@ -1237,7 +1360,7 @@ def main():
                             f"dist_exec(p50/p90/p99)={exec_p50:.3f}/{exec_p90:.3f}/{exec_p99:.3f}s "
                             f"dist_sim(p50/p90/p99)={sim_p50:.3f}/{sim_p90:.3f}/{sim_p99:.3f}s "
                             f"dist_cpu_util(p50/p90/p99)={cu_p50*100:.0f}/{cu_p90*100:.0f}/{cu_p99*100:.0f}% "
-                            f"ipc={ipc_time:.3f}s",
+                            f"ipc={ipc_time:.3f}s{gpu_txt}",
                             flush=True,
                         )
                     else:
@@ -1269,6 +1392,21 @@ def main():
                     print(
                         f"{pfx}{tag} Avg Sim/Step (critical env): {np.mean(chunk_sim_step_latencies):.3f}s  "
                         f"Avg CPU util (critical env): {np.mean(chunk_cpu_util_latencies)*100:.0f}%",
+                        flush=True,
+                    )
+
+                if bool(getattr(args, "profile_gpu", False)) and len(chunk_gpu_util) > 0:
+                    # Note: GPU stats are sampled once per chunk from the main process.
+                    # They reflect whatever GPU the renderer/driver is actually using.
+                    avg_gpu = float(np.mean(np.asarray(chunk_gpu_util, dtype=np.float64)))
+                    avg_mem = float(np.mean(np.asarray(chunk_gpu_mem, dtype=np.float64)))
+                    try:
+                        avg_used = float(np.mean(np.asarray(chunk_gpu_mem_used, dtype=np.float64)))
+                        avg_total = float(np.mean(np.asarray(chunk_gpu_mem_total, dtype=np.float64)))
+                    except Exception:
+                        avg_used, avg_total = 0.0, 0.0
+                    print(
+                        f"{pfx}{tag} Avg GPU util: {avg_gpu:.0f}%  Avg GPU mem util: {avg_mem:.0f}%  (avg {avg_used:.0f}/{avg_total:.0f}MiB)",
                         flush=True,
                     )
 

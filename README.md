@@ -134,6 +134,35 @@ Example:
 python rl_vec_env.py --num_envs 64 --max_steps 100 --task_class sweep_to_dustpan --action_chunk 54 --profile_timing
 ```
 
+### GPU utilization (best-effort sampling)
+To see whether your run is actually using the GPU for rendering, [`rl_vec_env.py`](rl_vec_env.py:1) supports `--profile_gpu`.
+
+This samples GPU utilization once per chunk from the **main process**:
+- First tries NVML via `pynvml` (if installed)
+- Otherwise falls back to calling `nvidia-smi`
+
+Flags:
+- `--profile_gpu`: enable sampling
+- `--gpu_index N`: choose the physical GPU index to sample (default: inferred from `CUDA_VISIBLE_DEVICES` first entry, else 0)
+
+Example:
+
+```bash
+python rl_vec_env.py \
+  --num_envs 64 \
+  --max_steps 100 \
+  --task_class sweep_to_dustpan \
+  --action_chunk 54 \
+  --output_dir rlbench_vec_env_videos \
+  --rgb_video_only \
+  --profile_timing \
+  --profile_gpu
+```
+
+Interpretation tip:
+- If `sim` is huge but `gpu` util is near 0%, you are likely CPU-bound or using software rendering.
+- If `gpu` util / `mem` util is high, rendering is likely GPU-backed.
+
 ### Reducing `sim` time when only recording env0
 If you enable video but (by default) only record env0, you usually still don’t want *all* envs to render RGB.
 
