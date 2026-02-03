@@ -479,6 +479,25 @@ def main():
     elif args.steps != 100:
         args.max_steps = args.steps
         
+    # Auto-configure CoppeliaSim environment
+    coppelia_root = os.environ.get("COPPELIASIM_ROOT")
+    if not coppelia_root:
+        # Try default location
+        default_root = os.path.expanduser("~/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04")
+        if os.path.isdir(default_root):
+            coppelia_root = default_root
+            os.environ["COPPELIASIM_ROOT"] = coppelia_root
+            print(f"Auto-detected COPPELIASIM_ROOT: {coppelia_root}", flush=True)
+
+    if coppelia_root and os.path.isdir(coppelia_root):
+        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if coppelia_root not in ld_path:
+            print(f"Auto-adding {coppelia_root} to LD_LIBRARY_PATH", flush=True)
+            os.environ["LD_LIBRARY_PATH"] = f"{ld_path}:{coppelia_root}" if ld_path else coppelia_root
+        
+        if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
+             os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = coppelia_root
+
     print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
     
