@@ -458,7 +458,7 @@ def main():
     parser = argparse.ArgumentParser()
     # Support both old and new args
     parser.add_argument("--num_envs", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=100, dest="max_steps")
+    parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--task", type=str, default="OpenDrawer", dest="task_class")
     parser.add_argument("--task_class", type=str, default="OpenDrawer")
