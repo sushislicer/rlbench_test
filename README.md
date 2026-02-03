@@ -234,6 +234,18 @@ python rl_vec_env.py \
 
 If EGL is not available, the run may fall back to software rendering or crash during context creation.
 
+### CPU Rendering (Xvfb)
+
+If GPU rendering is not available or fails, the script defaults to using Xvfb (software rendering via llvmpipe).
+This is robust but slower and CPU-intensive.
+
+```bash
+torchrun --nproc_per_node=4 rl_vec_env.py \
+  --render_backend xvfb \
+  --num_envs_total 64 \
+  --task_class OpenDrawer
+```
+
 ### Headless Rendering with EGL (No X11)
 
 To run without Xvfb/X11 and use GPU rendering directly:
