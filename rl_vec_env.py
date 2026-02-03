@@ -140,18 +140,22 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
         # This only works if your container/host has NVIDIA drivers + EGL/GLVND correctly installed.
         if render_backend == "egl":
             per_process_xvfb = False
-            # Qt offscreen + EGL hints (best-effort)
-            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "offscreen"
+            # Qt/EGL hints.
+            # IMPORTANT: do NOT use setdefault() here. If the parent environment sets e.g.
+            # QT_QPA_PLATFORM=offscreen, Qt will load the wrong plugin and you may get:
+            #   "This plugin does not support createPlatformOpenGLContext!"
+            # Force a sane EGL-capable default.
+            qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "minimalegl"
             qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "egl"
-            os.environ.setdefault("QT_QPA_PLATFORM", qpa)
-            os.environ.setdefault("QT_OPENGL", qt_opengl)
+            qt_xcb = _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none"
+            pyopengl = _norm_opt_str(env_config.get("pyopengl_platform")) or "egl"
+
+            os.environ["QT_QPA_PLATFORM"] = qpa
+            os.environ["QT_OPENGL"] = qt_opengl
             # Avoid XCB integration when running without X
-            os.environ.setdefault(
-                "QT_XCB_GL_INTEGRATION",
-                _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none",
-            )
+            os.environ["QT_XCB_GL_INTEGRATION"] = qt_xcb
             # Some OpenGL stacks respect this for EGL selection
-            os.environ.setdefault("PYOPENGL_PLATFORM", _norm_opt_str(env_config.get("pyopengl_platform")) or "egl")
+            os.environ["PYOPENGL_PLATFORM"] = pyopengl
             # Ensure we don't accidentally bind to an X display
             os.environ.pop("DISPLAY", None)
 
