@@ -458,9 +458,9 @@ def main():
     parser = argparse.ArgumentParser()
     # Support both old and new args
     parser.add_argument("--num_envs", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=100, dest="max_steps")
+    parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=100)
-    parser.add_argument("--task", type=str, default="OpenDrawer", dest="task_class")
+    parser.add_argument("--task", type=str, default="OpenDrawer")
     parser.add_argument("--task_class", type=str, default="OpenDrawer")
     parser.add_argument("--robot_setup", type=str, default="panda")
     parser.add_argument("--image_size", type=int, nargs=2, default=[256, 256])
@@ -474,10 +474,11 @@ def main():
     args, _ = parser.parse_known_args()
     
     # Handle aliases
-    if args.max_steps != 100 and args.steps == 100:
-        pass # max_steps set
-    elif args.steps != 100:
+    if args.steps != 100 and args.max_steps == 100:
         args.max_steps = args.steps
+    
+    if args.task != "OpenDrawer" and args.task_class == "OpenDrawer":
+        args.task_class = args.task
         
     print(f"COPPELIASIM_ROOT: {os.environ.get('COPPELIASIM_ROOT', 'NOT SET')}", flush=True)
     print(f"Initializing {args.num_envs} environments for task {args.task_class}...", flush=True)
