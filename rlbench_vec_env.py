@@ -417,28 +417,27 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
             #   "This plugin does not support createPlatformOpenGLContext!"
             # Force a sane EGL-capable default.
             # "offscreen" is the standard Qt headless platform.
-            # Debugging confirmed "offscreen" + "desktop" works on this system, while "minimalegl" fails.
+            # Debugging confirmed "offscreen" + "desktop" works on this system.
             qpa = _norm_opt_str(env_config.get("qt_qpa_platform")) or "offscreen"
             qt_opengl = _norm_opt_str(env_config.get("qt_opengl")) or "desktop"
-            qt_xcb = _norm_opt_str(env_config.get("qt_xcb_gl_integration")) or "none"
-            pyopengl = _norm_opt_str(env_config.get("pyopengl_platform")) or "egl"
-
+            
+            # We do NOT set QT_XCB_GL_INTEGRATION or PYOPENGL_PLATFORM by default anymore,
+            # as they might conflict with 'offscreen' + 'desktop' which worked in debug_egl.py.
+            
             os.environ["QT_QPA_PLATFORM"] = qpa
-            # QT_OPENGL=desktop usually forces hardware acceleration if available.
             if qt_opengl:
                 os.environ["QT_OPENGL"] = qt_opengl
-            # Avoid XCB integration when running without X
-            os.environ["QT_XCB_GL_INTEGRATION"] = qt_xcb
-            # Some OpenGL stacks respect this for EGL selection
-            os.environ["PYOPENGL_PLATFORM"] = pyopengl
+            
             # Ensure we don't accidentally bind to an X display
             os.environ.pop("DISPLAY", None)
             
-            # Ensure plugin path is set if we know COPPELIASIM_ROOT
-            if "QT_QPA_PLATFORM_PLUGIN_PATH" not in os.environ:
-                c_root = os.environ.get("COPPELIASIM_ROOT")
-                if c_root and os.path.isdir(c_root):
-                    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = c_root
+            # Force plugin path if we know COPPELIASIM_ROOT
+            c_root = os.environ.get("COPPELIASIM_ROOT")
+            if c_root and os.path.isdir(c_root):
+                os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = c_root
+                
+            if env_config.get("worker_log", False):
+                print(f"[Worker {rank}] EGL Env: QPA={qpa} OPENGL={qt_opengl} PLUGIN_PATH={os.environ.get('QT_QPA_PLATFORM_PLUGIN_PATH')}", flush=True)
 
         local_rank = _get_local_rank()
 
