@@ -108,6 +108,7 @@ def _worker_entry(rank: int, pipe: Connection, shm_info: dict, env_config: dict)
     env = None
     vw_front = None
     vw_wrist = None
+    
     try:
         # 1. Setup Display
         # Stagger start to reduce system load spikes (32 workers total)
@@ -387,6 +388,15 @@ class RLBenchVectorEnv:
         
         # Register cleanup
         atexit.register(self.close)
+
+        # Ensure LD_LIBRARY_PATH is set correctly so workers can find libcoppeliaSim.so.1
+        # This must be done in the parent before spawning workers.
+        c_root = os.environ.get("COPPELIASIM_ROOT")
+        if c_root:
+            current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            if c_root not in current_ld:
+                os.environ["LD_LIBRARY_PATH"] = f"{c_root}:{current_ld}"
+                print(f"[RLBenchVecEnv] Added COPPELIASIM_ROOT to LD_LIBRARY_PATH: {os.environ['LD_LIBRARY_PATH']}", flush=True)
         
         # Create Shared Memory
         for name, (shape, dtype) in self.shm_specs.items():
